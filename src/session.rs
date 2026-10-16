@@ -129,8 +129,18 @@ pub async fn start(
     )?);
     let sender: Arc<dyn RtpSender> = pc.add_track(track.clone() as Arc<dyn TrackLocal>).await?;
 
+    let offer: RTCSessionDescription =
+        serde_json::from_value(serde_json::json!({ "type": "offer", "sdp": offer_sdp }))
+            .context("invalid offer SDP JSON")?;
+    pc.set_remote_description(offer).await?;
+
+    let answer = pc.create_answer(None).await?;
+    pc.set_local_description(answer).await?;
+
     // write_sample stamps the payload type on every packet; it must match
-    // the codec negotiated for this sender.
+    // the codec negotiated for this sender. The sender's codec list is only
+    // populated with the negotiated PT once the descriptions are set, so
+    // read it here — after negotiation, not before.
     let payload_type = sender
         .get_parameters()
         .await?
@@ -139,14 +149,7 @@ pub async fn start(
         .first()
         .map(|c| c.payload_type)
         .ok_or_else(|| anyhow::anyhow!("sender has no negotiated codec"))?;
-
-    let offer: RTCSessionDescription =
-        serde_json::from_value(serde_json::json!({ "type": "offer", "sdp": offer_sdp }))
-            .context("invalid offer SDP JSON")?;
-    pc.set_remote_description(offer).await?;
-
-    let answer = pc.create_answer(None).await?;
-    pc.set_local_description(answer).await?;
+    tracing::debug!("negotiated video payload type: {payload_type}");
 
     // Non-trickle ICE: wait for candidate gathering to finish, then hand the
     // complete answer back over the (already open) WebSocket.
