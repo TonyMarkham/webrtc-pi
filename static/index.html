@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pi Camera</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { margin: 0; height: 100%; background: #111; color: #ddd;
+                 font-family: system-ui, sans-serif; display: flex;
+                 flex-direction: column; }
+    video { flex: 1; min-height: 0; width: 100%; object-fit: contain; background: #000; }
+    #bar { display: flex; gap: 10px; align-items: center; padding: 8px 14px; flex-wrap: wrap; }
+    button { background: #2a2a2a; color: #ddd; border: 1px solid #444;
+             border-radius: 6px; padding: 6px 16px; font-size: 14px; cursor: pointer; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    #interval, #shutter, #gain { width: 6ch; background: #1c1c1c; color: #ddd; border: 1px solid #444;
+                border-radius: 6px; padding: 6px 8px; font-size: 14px; }
+    #cam-status { font-size: 13px; color: #888; }
+    #cam-status.streaming { color: #7bd88f; }
+    #cam-status.capturing { color: #6fb7ff; }
+    #cam-status.error { color: #ff6b6b; }
+    #status { padding: 8px 14px; font-size: 14px; }
+    #status.error { color: #ff6b6b; }
+    #status.ok { color: #7bd88f; }
+    #gallery { display: none; max-height: 40vh; overflow-y: auto; padding: 10px 14px;
+               border-top: 1px solid #2a2a2a; }
+    .run-head { display: flex; gap: 12px; align-items: center; margin: 8px 0 6px; }
+    .run-head .name { color: #aaa; font-size: 13px; }
+    .run-head button { padding: 3px 10px; font-size: 12px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 8px; }
+    .grid a img { width: 100%; aspect-ratio: 4 / 3; object-fit: cover;
+                  border-radius: 4px; display: block; }
+  </style>
+</head>
+<body>
+  <div id="bar">
+    <button id="btn-stream">Start video</button>
+    <button id="btn-capture">Start capture</button>
+    <input id="interval" type="number" step="0.5" min="0.05" value="1">s
+    <input id="shutter" type="number" step="100" min="0" placeholder="auto">µs
+    <input id="gain" type="number" step="0.5" min="0" max="32" placeholder="auto">x
+    <button id="btn-stop">Stop</button>
+    <span id="cam-status">checking&hellip;</span>
+  </div>
+  <video id="video" autoplay muted playsinline></video>
+  <div id="gallery"></div>
+  <div id="status">connecting&hellip;</div>
+  <script>
+    const video = document.getElementById('video');
+    const status = document.getElementById('status');
+    const camStatus = document.getElementById('cam-status');
+    const streamBtn = document.getElementById('btn-stream');
+    const captureBtn = document.getElementById('btn-capture');
+    const stopBtn = document.getElementById('btn-stop');
+    const intervalInput = document.getElementById('interval');
+    const shutterInput = document.getElementById('shutter');
+    const gainInput = document.getElementById('gain');
+    const gallery = document.getElementById('gallery');
+
+    function setStatus(text, cls) {
+      status.textContent = text;
+      status.className = cls || '';
+    }
+
+    // ---- camera modes ----------------------------------------------------
+    async function refreshCameraStatus() {
+      try {
+        const s = await (await fetch('/camera/status')).json();
+        if (s.mode === 'streaming') {
+          camStatus.textContent = 'streaming';
+          camStatus.className = 'streaming';
+          streamBtn.disabled = true; captureBtn.disabled = false; stopBtn.disabled = false;
+          if (video.readyState === 0) setStatus('peer connected, waiting for video…');
+        } else if (s.mode === 'capturing') {
+          const sh = s.shutter_us > 0 ? `shutter ${s.shutter_us}µs` : 'shutter auto';
+          const gn = s.gain > 0 ? `gain ${s.gain}` : 'gain auto';
+          camStatus.textContent = `capturing (every ${s.interval_secs}s, ${sh}, ${gn}) — ${s.images} image${s.images === 1 ? '' : 's'}`;
+          camStatus.className = 'capturing';
+          streamBtn.disabled = false; captureBtn.disabled = false; stopBtn.disabled = false;
+          setStatus('capture mode — live view is off', 'error');
+        } else {
+          camStatus.textContent = s.error ? 'error: ' + s.error : 'camera stopped';
+          camStatus.className = s.error ? 'error' : '';
+          streamBtn.disabled = false; captureBtn.disabled = false; stopBtn.disabled = true;
+        }
+      } catch {
+        camStatus.textContent = 'status unavailable';
+        camStatus.className = 'error';
+      }
+    }
+    streamBtn.onclick = () => fetch('/camera/start', { method: 'POST' }).then(refreshCameraStatus);
+    captureBtn.onclick = () => {
+      const secs = parseFloat(intervalInput.value) || 1;
+      const us = parseInt(shutterInput.value) || 0;
+      const g = parseFloat(gainInput.value) || 0;
+      fetch(`/camera/capture?interval=${secs}&shutter=${us}&gain=${g}`, { method: 'POST' })
+        .then(refreshCameraStatus);
+    };
+    stopBtn.onclick = () => fetch('/camera/stop', { method: 'POST' }).then(refreshCameraStatus);
+    setInterval(refreshCameraStatus, 3000);
+    refreshCameraStatus();
+
+    // ---- captured images -------------------------------------------------
+    let knownRuns = new Set();
+    async function refreshGallery() {
+      let images;
+      try { images = await (await fetch('/images?limit=500')).json(); }
+      catch { return; }
+      if (!images.length) { gallery.style.display = 'none'; gallery.innerHTML = ''; knownRuns.clear(); return; }
+      gallery.style.display = 'block';
+      // Group by run directory, newest runs first.
+      const runs = new Map();
+      for (const img of images) {
+        const run = img.path.includes('/') ? img.path.split('/')[0] : 'runs';
+        if (!runs.has(run)) runs.set(run, []);
+        runs.get(run).push(img);
+      }
+      const frag = document.createDocumentFragment();
+      for (const [run, files] of runs) {
+        const head = document.createElement('div');
+        head.className = 'run-head';
+        const label = document.createElement('span');
+        label.className = 'name';
+        label.textContent = `${run} — ${files.length} image${files.length === 1 ? '' : 's'}`;
+        const tar = document.createElement('button');
+        tar.textContent = 'Download .tar';
+        tar.onclick = () => { location.href = `/images/archive.tar?path=${encodeURIComponent(run)}`; };
+        const del = document.createElement('button');
+        del.textContent = 'Delete';
+        del.onclick = async () => {
+          if (!confirm(`Delete ${run} (${files.length} images)?`)) return;
+          await fetch(`/images?path=${encodeURIComponent(run)}`, { method: 'DELETE' });
+          refreshGallery();
+        };
+        head.append(label, tar, del);
+        const grid = document.createElement('div');
+        grid.className = 'grid';
+        for (const img of files) {
+          const a = document.createElement('a');
+          a.href = `/images/file?path=${encodeURIComponent(img.path)}`;
+          a.setAttribute('download', img.path.split('/').pop());
+          const im = document.createElement('img');
+          im.loading = 'lazy';
+          im.src = a.href;
+          im.title = img.path.split('/').pop();
+          a.append(im);
+          grid.append(a);
+        }
+        frag.append(head, grid);
+      }
+      gallery.replaceChildren(frag);
+    }
+    setInterval(refreshGallery, 3000);
+    refreshGallery();
+
+    // ---- live view signaling --------------------------------------------
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    });
+
+    pc.addTransceiver('video', { direction: 'recvonly' });
+
+    pc.ontrack = (e) => {
+      video.srcObject = e.streams[0];
+      video.play().catch(() => setStatus('tap/click to start playback'));
+    };
+    video.onplay = () => setStatus('streaming', 'ok');
+
+    pc.onconnectionstatechange = () => {
+      switch (pc.connectionState) {
+        case 'connecting': setStatus('negotiating…'); break;
+        case 'connected':  setStatus('peer connected, waiting for video…'); break;
+        case 'failed':     setStatus('connection failed — reload to retry', 'error'); break;
+        case 'disconnected':
+        case 'closed':     setStatus('disconnected — reload to reconnect', 'error'); break;
+      }
+    };
+
+    const ws = new WebSocket(`ws://${location.host}/ws`);
+
+    ws.onopen = async () => {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      // Non-trickle: wait for gathering (with a timeout fallback) so the
+      // SDP we send contains all candidates.
+      await new Promise((resolve) => {
+        if (pc.iceGatheringState === 'complete') return resolve();
+        const done = () => { pc.removeEventListener('icegatheringstatechange', done); resolve(); };
+        pc.addEventListener('icegatheringstatechange', () =>
+          pc.iceGatheringState === 'complete' && done());
+        setTimeout(done, 2000);
+      });
+      ws.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp }));
+      setStatus('offer sent, waiting for answer…');
+    };
+
+    ws.onmessage = async (e) => {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'answer') {
+        await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+        setStatus('connecting…');
+      } else if (msg.type === 'error') {
+        setStatus('server error: ' + msg.sdp, 'error');
+      }
+    };
+
+    ws.onclose = () => setStatus('signaling connection lost — reload to retry', 'error');
+  </script>
+</body>
+</html>
