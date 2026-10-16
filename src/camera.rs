@@ -12,7 +12,7 @@
 //! and reused across streaming restarts, so viewers can be connected while
 //! the camera is stopped or capturing — they simply wait for frames.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,7 +24,21 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 
 use crate::capture::{self, CameraSettings};
+use crate::derive;
 use crate::encode::{self, EncodedFrame, EncoderSettings};
+
+/// Recursively collect `.jpg` files under `dir`.
+fn walk_jpgs(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_jpgs(&path, out)?;
+        } else if path.extension().is_some_and(|e| e == "jpg") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
 
 /// Still-image capture settings.
 #[derive(Clone, Copy, Debug)]
@@ -125,6 +139,9 @@ pub struct CameraManager {
     /// shared across streaming restarts.
     frames: broadcast::Sender<Arc<EncodedFrame>>,
     inner: Mutex<Inner>,
+    /// Serializes variant derivation so concurrent tar downloads of the same
+    /// fresh run don't derive it twice.
+    deriving: Mutex<()>,
 }
 
 impl CameraManager {
@@ -142,6 +159,7 @@ impl CameraManager {
             capture_dir,
             frames,
             inner: Mutex::new(Inner::default()),
+            deriving: Mutex::new(()),
         }
     }
 
@@ -472,17 +490,14 @@ impl CameraManager {
             .unwrap_or(0)
     }
 
-    /// All image paths of one run, in capture order.
+    /// All image paths of one run (including derived-variant subdirectories),
+    /// sorted so tar members group by variant.
     fn run_images(&self, run: &str) -> anyhow::Result<Vec<PathBuf>> {
         let dir = self
             .resolve(run)
             .context("unknown or invalid run name")?;
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .context("failed to read run directory")?
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| e == "jpg"))
-            .collect();
+        let mut files = Vec::new();
+        walk_jpgs(&dir, &mut files)?;
         files.sort();
         Ok(files)
     }
@@ -510,11 +525,29 @@ impl CameraManager {
     /// Tar one run's images into `tx`. Intended to run on a blocking thread:
     /// chunks are sent with bounded backpressure, and the consumer going
     /// away (client disconnect) makes the write fail, ending the tar early.
+    ///
+    /// If the run's derived variants don't exist yet, they are generated
+    /// first — a download always yields the complete set.
     pub fn tar_run(
         &self,
         run: &str,
         tx: tokio::sync::mpsc::Sender<Result<Bytes, String>>,
     ) -> anyhow::Result<()> {
+        {
+            let _guard = self.deriving.lock().unwrap();
+            let dir = self.resolve(run).context("unknown or invalid run name")?;
+            if derive::needs_derive(&dir) {
+                tracing::info!("deriving variants for {run} before download");
+                match derive::derive_run(&dir) {
+                    Ok(n) => tracing::info!("derived {n} images for {run}"),
+                    Err(e) => {
+                        // The tar still proceeds with whatever exists.
+                        tracing::error!("variant derivation failed for {run}: {e:#}");
+                    }
+                }
+            }
+        }
+
         struct ChanWriter {
             tx: tokio::sync::mpsc::Sender<Result<Bytes, String>>,
         }

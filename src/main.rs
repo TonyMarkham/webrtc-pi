@@ -7,6 +7,7 @@
 
 mod camera;
 mod capture;
+mod derive;
 mod encode;
 mod session;
 mod state;
