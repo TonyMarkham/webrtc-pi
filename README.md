@@ -109,6 +109,23 @@ unexpectedly the server stays up and reports the failure via `/camera/status`.
 Set `RUST_LOG=debug` for verbose logging. Works over the LAN with host
 candidates only; the Google STUN server is included for wider routability.
 
+### Deriving training-data variants
+
+`derive-variants` generates downscaled/greyscale variants from a capture run,
+with the transforms defined once (exact 2x2 box average for the 1/2 scale,
+BT.601 luma for greyscale) so training and inference preprocess identically:
+
+```sh
+./target/release/derive-variants captures/run-<timestamp>
+# writes half/, grey/, half-grey/ inside the run directory
+```
+
+| Variant | Size | Content |
+| --- | --- | --- |
+| `half/` | 720x540 | colour |
+| `grey/` | 1440x1080 | greyscale |
+| `half-grey/` | 720x540 | greyscale |
+
 ## Limitations / roadmap
 
 - Video only — no audio track yet.
