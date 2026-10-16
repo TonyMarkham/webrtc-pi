@@ -2,8 +2,6 @@
 //! endpoint used to exchange SDP offers/answers, the camera mode controls,
 //! and download access to the captured stills.
 
-use std::time::Duration;
-
 use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
@@ -50,8 +48,8 @@ async fn camera_start(State(state): State<AppState>) -> Response {
 
 #[derive(Deserialize)]
 struct CaptureQuery {
-    /// Seconds between stills. Omit to use the server default.
-    interval: Option<f64>,
+    /// Frames per second (1..60). Omit to use the server default.
+    fps: Option<u32>,
     /// Exposure time in microseconds; 0 = auto. Omit for the server default.
     shutter: Option<u32>,
     /// Analog gain; 0 = auto. Omit for the server default.
@@ -62,22 +60,15 @@ async fn camera_capture(
     State(state): State<AppState>,
     Query(q): Query<CaptureQuery>,
 ) -> Response {
-    let interval = match q.interval {
-        Some(secs) if (0.05..=3600.0).contains(&secs) => Duration::from_secs_f64(secs),
-        Some(_) => {
+    if let Some(fps) = q.fps {
+        if fps == 0 || fps > 60 {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "interval must be 0.05..3600 seconds" })),
+                Json(serde_json::json!({ "error": "fps must be 1..60" })),
             )
-                .into_response()
+                .into_response();
         }
-        None => Duration::ZERO, // use the server default
-    };
-    let interval = if interval.is_zero() {
-        state.camera.default_interval()
-    } else {
-        interval
-    };
+    }
     if let Some(s) = q.shutter {
         if s > 1_000_000 {
             return (
@@ -96,9 +87,10 @@ async fn camera_capture(
                 .into_response();
         }
     }
+    let fps = q.fps.unwrap_or_else(|| state.camera.default_fps());
     let shutter = q.shutter.or_else(|| Some(state.camera.default_shutter_us()));
     let gain = q.gain.or_else(|| Some(state.camera.default_gain()));
-    match state.camera.capture(interval, shutter, gain).await {
+    match state.camera.capture(fps, shutter, gain).await {
         Ok(run) => Json(serde_json::json!({ "mode": "capturing", "run": run })).into_response(),
         Err(e) => camera_error(e),
     }

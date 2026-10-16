@@ -6,11 +6,13 @@
 //! 2 seconds so new viewers can join without waiting for scene changes.
 
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use x264::{Colorspace, Image, Plane, Preset, Setup, Tune};
+
+use crate::capture::Frame;
 
 /// One encoded H.264 frame in Annex-B format.
 pub struct EncodedFrame {
@@ -32,7 +34,7 @@ pub struct EncoderSettings {
 /// encoded frames on the broadcast channel for every connected viewer.
 pub fn spawn(
     settings: EncoderSettings,
-    rx: Receiver<Vec<u8>>,
+    rx: mpsc::Receiver<Frame>,
     tx: broadcast::Sender<Arc<EncodedFrame>>,
 ) -> anyhow::Result<()> {
     std::thread::Builder::new()
@@ -41,7 +43,7 @@ pub fn spawn(
     Ok(())
 }
 
-fn run(settings: EncoderSettings, rx: Receiver<Vec<u8>>, tx: broadcast::Sender<Arc<EncodedFrame>>) {
+fn run(settings: EncoderSettings, mut rx: mpsc::Receiver<Frame>, tx: broadcast::Sender<Arc<EncodedFrame>>) {
     let EncoderSettings {
         width,
         height,
@@ -49,7 +51,6 @@ fn run(settings: EncoderSettings, rx: Receiver<Vec<u8>>, tx: broadcast::Sender<A
         bitrate_kbps,
     } = settings;
     let (w, h) = (width as i32, height as i32);
-    let (y_size, c_size) = ((width * height) as usize, ((width * height) / 4) as usize);
 
     let mut encoder = Setup::preset(Preset::Veryfast, Tune::None, false, true)
         .fps(fps, 1)
@@ -73,30 +74,33 @@ fn run(settings: EncoderSettings, rx: Receiver<Vec<u8>>, tx: broadcast::Sender<A
     let mut pts: i64 = 0;
 
     loop {
-        let frame = match rx.recv() {
-            Ok(frame) => frame,
-            Err(_) => break, // capture side is gone; shut down
+        let frame = match rx.blocking_recv() {
+            Some(frame) => frame,
+            None => break, // capture side is gone; shut down
         };
-        if frame.len() != y_size + 2 * c_size {
-            tracing::warn!("dropping malformed frame ({} bytes)", frame.len());
+        let expected = frame.buffer_size();
+        if frame.data.len() != expected {
+            tracing::warn!("dropping malformed frame ({} bytes, expected {expected})", frame.data.len());
             continue;
         }
 
-        let (y, rest) = frame.split_at(y_size);
-        let (u, v) = rest.split_at(c_size);
+        let stride = frame.stride as i32;
         let image = Image::new(
             Colorspace::I420,
             w,
             h,
             &[
-                Plane { stride: w, data: y },
                 Plane {
-                    stride: w / 2,
-                    data: u,
+                    stride,
+                    data: &frame.data[..frame.chroma_offset()],
                 },
                 Plane {
-                    stride: w / 2,
-                    data: v,
+                    stride: stride / 2,
+                    data: &frame.data[frame.chroma_offset()..frame.chroma_offset() + frame.chroma_plane_size()],
+                },
+                Plane {
+                    stride: stride / 2,
+                    data: &frame.data[frame.chroma_offset() + frame.chroma_plane_size()..],
                 },
             ],
         );

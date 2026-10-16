@@ -21,8 +21,8 @@ preset + `zerolatency` tune keep encoding latency to a frame or two.
 
 | Component | Choice |
 | --- | --- |
-| Capture | `rpicam-vid --codec yuv420`, raw I420 frames piped to the server |
-| Encode | [`x264`](https://crates.io/crates/x264) (baseline profile, 2s keyframe interval) |
+| Capture | `rpicam-vid --codec yuv420`, raw I420 frames piped to the server (streaming), or continuous native-res frames center-cropped to 1440x1080 and JPEG-encoded (capture mode) |
+| Encode | [`x264`](https://crates.io/crates/x264) (baseline profile, 2s keyframe interval); [`turbojpeg`](https://crates.io/crates/turbojpeg) for capture-mode JPEGs |
 | WebRTC | [`webrtc-rs`](https://github.com/webrtc-rs/webrtc) 0.21 |
 | Signaling | Embedded page + WebSocket (`/ws`), non-trickle SDP exchange |
 | HTTP | `axum` |
@@ -33,6 +33,8 @@ preset + `zerolatency` tune keep encoding latency to a frame or two.
 # 1. System packages: C toolchain, x264 headers, camera apps, clang (for bindgen)
 sudo apt update
 sudo apt install -y build-essential pkg-config libx264-dev rpicam-apps libclang-dev
+# capture mode builds its bundled libjpeg-turbo from source (see .cargo/config.toml)
+sudo apt install -y cmake
 
 # Make sure your user can access the camera
 sudo usermod -aG video,gpio $USER   # log out/in afterwards
@@ -74,17 +76,24 @@ cargo run --release -- --help
 - `--port` — HTTP port (default 8080)
 - `--auto-start` — start streaming at boot
 - `--capture-dir` — where capture runs are written (default `captures`)
-- `--still-width/--still-height` — still image size (default 1440x1080)
-- `--capture-interval` — default seconds between stills (default 1.0)
+- `--still-width/--still-height` — still image size (default 1440x1080); stills
+  are center-cropped from the native sensor frame, 1:1 pixels
+- `--sensor-width/--sensor-height` — native sensor frame size (default 1456x1088)
+- `--capture-fps` — default capture rate (default 30)
 - `--shutter` — fixed exposure in µs for stills (default 0 = auto)
 - `--gain` — fixed analog gain for stills (default 0 = auto)
+- `--jpeg-quality` — JPEG quality for stills (default 93)
+
+Note: `rpicam-vid` writes YUV frames with the libcamera row stride (width
+rounded up to a multiple of 128 bytes); the pipeline handles that internally.
+At 30 fps a run writes ~180 KB/frame ≈ 5 MB/s ≈ 19 GB/hour.
 
 ### Camera control API
 
 | Route | Method | Effect |
 | --- | --- | --- |
 | `/camera/start` | POST | Switch to streaming. Idempotent. |
-| `/camera/capture?interval=1.0&shutter=1000&gain=8` | POST | Switch to capture mode: stop the live view and write JPEGs into a new run directory (`captures/run-<unix-seconds>/img_NNNN.jpg`). `interval` (seconds), `shutter` (µs, 0 = auto) and `gain` (0 = auto) are optional; per-request values override the CLI defaults. Use a short shutter to freeze motion — the IMX296 is global-shutter, so blur is purely exposure time — and raise gain (or lighting) to compensate. |
+| `/camera/capture?fps=30&shutter=1000&gain=8` | POST | Switch to capture mode: stop the live view and record **continuously** — every frame is written as a JPEG into a new run directory (`captures/run-<unix-seconds>/img_NNNNNN.jpg`). Frames are captured at native sensor resolution (1456x1088) and center-cropped to `--still-width/--still-height` (1440x1080), so every output pixel is a real sensor pixel — no ISP resampling. `fps` (1..60), `shutter` (µs, 0 = auto) and `gain` (0 = auto) are optional; per-request values override the CLI defaults. Use a short shutter to freeze motion — the IMX296 is global-shutter, so blur is purely exposure time — and raise gain (or lighting) to compensate. |
 | `/camera/stop` | POST | Stop whichever mode is active. Idempotent. |
 | `/camera/status` | GET | `{"mode": "streaming"\|"capturing"\|"stopped"}`, plus `run`, `images`, `interval_secs` while capturing and `error` after a failure. |
 | `/images?limit=500` | GET | List saved stills, newest first. |

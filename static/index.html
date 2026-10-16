@@ -14,7 +14,7 @@
     button { background: #2a2a2a; color: #ddd; border: 1px solid #444;
              border-radius: 6px; padding: 6px 16px; font-size: 14px; cursor: pointer; }
     button:disabled { opacity: 0.4; cursor: default; }
-    #interval, #shutter, #gain { width: 6ch; background: #1c1c1c; color: #ddd; border: 1px solid #444;
+    #interval, #shutter, #gain, #fps { width: 6ch; background: #1c1c1c; color: #ddd; border: 1px solid #444;
                 border-radius: 6px; padding: 6px 8px; font-size: 14px; }
     #cam-status { font-size: 13px; color: #888; }
     #cam-status.streaming { color: #7bd88f; }
@@ -38,7 +38,7 @@
   <div id="bar">
     <button id="btn-stream">Start video</button>
     <button id="btn-capture">Start capture</button>
-    <input id="interval" type="number" step="0.5" min="0.05" value="1">s
+    <input id="fps" type="number" step="1" min="1" max="60" value="30">fps
     <input id="shutter" type="number" step="100" min="0" placeholder="auto">µs
     <input id="gain" type="number" step="0.5" min="0" max="32" placeholder="auto">x
     <button id="btn-stop">Stop</button>
@@ -54,7 +54,7 @@
     const streamBtn = document.getElementById('btn-stream');
     const captureBtn = document.getElementById('btn-capture');
     const stopBtn = document.getElementById('btn-stop');
-    const intervalInput = document.getElementById('interval');
+    const intervalInput = document.getElementById('fps');
     const shutterInput = document.getElementById('shutter');
     const gainInput = document.getElementById('gain');
     const gallery = document.getElementById('gallery');
@@ -76,7 +76,7 @@
         } else if (s.mode === 'capturing') {
           const sh = s.shutter_us > 0 ? `shutter ${s.shutter_us}µs` : 'shutter auto';
           const gn = s.gain > 0 ? `gain ${s.gain}` : 'gain auto';
-          camStatus.textContent = `capturing (every ${s.interval_secs}s, ${sh}, ${gn}) — ${s.images} image${s.images === 1 ? '' : 's'}`;
+          camStatus.textContent = `capturing ${s.fps} fps (${sh}, ${gn}) — ${s.images} image${s.images === 1 ? '' : 's'}`;
           camStatus.className = 'capturing';
           streamBtn.disabled = false; captureBtn.disabled = false; stopBtn.disabled = false;
           setStatus('capture mode — live view is off', 'error');
@@ -92,10 +92,10 @@
     }
     streamBtn.onclick = () => fetch('/camera/start', { method: 'POST' }).then(refreshCameraStatus);
     captureBtn.onclick = () => {
-      const secs = parseFloat(intervalInput.value) || 1;
+      const fps = parseInt(intervalInput.value) || 30;
       const us = parseInt(shutterInput.value) || 0;
       const g = parseFloat(gainInput.value) || 0;
-      fetch(`/camera/capture?interval=${secs}&shutter=${us}&gain=${g}`, { method: 'POST' })
+      fetch(`/camera/capture?fps=${fps}&shutter=${us}&gain=${g}`, { method: 'POST' })
         .then(refreshCameraStatus);
     };
     stopBtn.onclick = () => fetch('/camera/stop', { method: 'POST' }).then(refreshCameraStatus);

@@ -10,11 +10,11 @@ mod capture;
 mod encode;
 mod session;
 mod state;
+mod stillrec;
 mod web;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
@@ -51,15 +51,24 @@ struct Args {
     /// Still image height (capture mode).
     #[arg(long, default_value_t = 1080)]
     still_height: u32,
-    /// Default seconds between stills in capture mode.
-    #[arg(long, default_value_t = 1.0)]
-    capture_interval: f64,
+    /// Default capture rate in frames per second (continuous capture mode).
+    #[arg(long, default_value_t = 30)]
+    capture_fps: u32,
     /// Fixed exposure time in microseconds for capture mode (0 = auto).
     #[arg(long, default_value_t = 0)]
     shutter: u32,
     /// Fixed analog gain for capture mode (0 = auto).
     #[arg(long, default_value_t = 0.0)]
     gain: f32,
+    /// JPEG quality for capture mode (1..100).
+    #[arg(long, default_value_t = 93)]
+    jpeg_quality: i32,
+    /// Native sensor frame width (stills are center-cropped from this).
+    #[arg(long, default_value_t = 1456)]
+    sensor_width: u32,
+    /// Native sensor frame height.
+    #[arg(long, default_value_t = 1088)]
+    sensor_height: u32,
 }
 
 #[tokio::main]
@@ -89,9 +98,12 @@ async fn main() -> anyhow::Result<()> {
     let still = camera::StillSettings {
         width: args.still_width,
         height: args.still_height,
-        interval: Duration::from_secs_f64(args.capture_interval),
+        sensor_width: args.sensor_width,
+        sensor_height: args.sensor_height,
+        fps: args.capture_fps,
         shutter_us: args.shutter,
         gain: args.gain,
+        jpeg_quality: args.jpeg_quality,
     };
     let camera = Arc::new(camera::CameraManager::new(
         camera_settings,

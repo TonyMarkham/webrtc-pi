@@ -20,8 +20,10 @@ cargo run --release         # serves http://0.0.0.0:8080
 
 System dependencies (already installed on this machine, but needed on a
 fresh Pi 5): `build-essential pkg-config libx264-dev rpicam-apps
-libclang-dev`. `libclang` is required because `x264-sys` runs bindgen at
-build time.
+libclang-dev cmake`. `libclang` is required because `x264-sys` runs bindgen
+at build time; `cmake` because capture mode builds its bundled
+libjpeg-turbo (see `.cargo/config.toml`, `TURBOJPEG_SOURCE=vendor` — the
+system libturbojpeg is too old for the 3.x API).
 
 `RUST_LOG=debug` enables verbose logging.
 
@@ -29,11 +31,14 @@ build time.
 
 ```
 camera.rs    CameraManager: mode machine (stopped/streaming/capturing) that
-             owns the camera process handles; starts rpicam-vid+x264 for
-             streaming or rpicam-still --timelapse for full-res stills;
-             also serves image listing/download/tar/delete for capture runs
+             owns the camera process handles; streaming = rpicam-vid+x264,
+             capture = rpicam-vid at native res + stillrec JPEG writer; also
+             image listing/download/tar/delete for capture runs
 capture.rs   spawns rpicam-vid --codec yuv420, reads exact-size I420 frames
-             from stdout on a dedicated thread (std::sync::mpsc)
+             from stdout on a dedicated thread; frames carry the libcamera
+             row stride (width rounded up to 128 bytes)
+stillrec.rs  capture-mode worker: zero-copy center-crop (plane pointers +
+             strides) and TurboJPEG encode of every frame, 30 fps
 encode.rs    x264 encoder thread: I420 -> H.264 Annex-B, publishes frames on
              a tokio broadcast channel; prepends SPS/PPS to every keyframe
 session.rs   one webrtc-rs PeerConnection per viewer: negotiation, track
@@ -63,8 +68,11 @@ streaming pipeline and vice versa.
   colorspaces are `Colorspace::I420` etc. `x264::Error` does not implement
   `Display` — format with `{:?}`.
 - `rpicam-vid --codec yuv420` emits an unframed I420 byte stream: Y plane
-  (`w*h`) then U then V (`w*h/4` each). Frames are read with `read_exact`;
-  there is no framing to resync on.
+  then U then V, with **padded row strides** — the stride is the width
+  rounded up to a multiple of 128 bytes (1280 -> 1280, 1456 -> 1536; see
+  `capture::Frame::stride_for`). Frames are read with `read_exact`; there
+  is no framing to resync on. Capture mode reads at native sensor
+  resolution and center-crops to the still size, 1:1 pixels.
 - **Keyframes**: browsers can only start decoding on an IDR. The encoder
   forces one every 2 s (`max_keyframe_interval = 2*fps`, `scenecut 0`), and
   viewer tasks wait for a keyframe before sending. PLI/FIR feedback is NOT

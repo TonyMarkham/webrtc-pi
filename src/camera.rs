@@ -13,7 +13,7 @@
 //! the camera is stopped or capturing — they simply wait for frames.
 
 use std::path::PathBuf;
-use std::process::{Child, Stdio};
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -31,8 +31,12 @@ use crate::encode::{self, EncodedFrame, EncoderSettings};
 pub struct StillSettings {
     pub width: u32,
     pub height: u32,
-    /// Default gap between stills; overridable per request.
-    pub interval: Duration,
+    /// Native sensor frame size; stills are center-cropped from it when the
+    /// output fits, so every output pixel is a real sensor pixel.
+    pub sensor_width: u32,
+    pub sensor_height: u32,
+    /// Default capture rate; overridable per request.
+    pub fps: u32,
     /// Fixed exposure time in microseconds; 0 = auto. Short exposures freeze
     /// motion (at the cost of gain/noise, since the IMX296 is global shutter
     /// and blur is purely a function of exposure time).
@@ -40,6 +44,8 @@ pub struct StillSettings {
     /// Fixed analog gain; 0 = auto. The counterpart to `shutter_us`: short
     /// exposures need more gain to stay bright.
     pub gain: f32,
+    /// JPEG quality (1..100).
+    pub jpeg_quality: i32,
 }
 
 /// What the camera is currently doing.
@@ -61,9 +67,12 @@ enum Pipeline {
     },
     Capturing {
         child: Child,
+        /// Set before we kill the process so the capture reader thread can
+        /// distinguish an intentional stop from a camera failure.
+        stopping: Arc<AtomicBool>,
         /// Subdirectory of `capture_dir` this run writes into.
         run: String,
-        interval: Duration,
+        fps: u32,
         shutter_us: u32,
         gain: f32,
     },
@@ -87,7 +96,7 @@ pub struct CameraStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub interval_secs: Option<f64>,
+    pub fps: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shutter_us: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,14 +164,15 @@ impl CameraManager {
 
         inner.last_error = None;
         let stopping = Arc::new(AtomicBool::new(false));
-        let (rx, mut child) = match capture::spawn(&self.camera, Arc::clone(&stopping)) {
-            Ok(ok) => ok,
-            Err(e) => {
-                let msg = format!("failed to launch rpicam-vid: {e:#}");
-                inner.last_error = Some(msg.clone());
-                anyhow::bail!(msg);
-            }
-        };
+        let (rx, mut child) =
+            match capture::spawn(&self.camera, Arc::clone(&stopping), &[]) {
+                Ok(ok) => ok,
+                Err(e) => {
+                    let msg = format!("failed to launch rpicam-vid: {e:#}");
+                    inner.last_error = Some(msg.clone());
+                    anyhow::bail!(msg);
+                }
+            };
         encode::spawn(self.encoder, rx, self.frames.clone())?;
 
         // rpicam-vid can die immediately (camera busy, no camera attached).
@@ -181,24 +191,25 @@ impl CameraManager {
         Ok(())
     }
 
-    /// Start a capture run: stop any current mode, then run
-    /// `rpicam-still --timelapse`, writing JPEGs into a fresh run directory.
-    /// Idempotent only in the sense that it always begins a *new* run.
+    /// Start a capture run: stop any current mode, then capture
+    /// **continuously** — every frame the camera delivers is written as a
+    /// JPEG into a fresh run directory. Idempotent only in the sense that it
+    /// always begins a *new* run.
     pub async fn capture(
         self: &Arc<Self>,
-        interval: Duration,
+        fps: u32,
         shutter_us: Option<u32>,
         gain: Option<f32>,
     ) -> anyhow::Result<String> {
         let manager = Arc::clone(self);
-        tokio::task::spawn_blocking(move || manager.capture_blocking(interval, shutter_us, gain))
+        tokio::task::spawn_blocking(move || manager.capture_blocking(fps, shutter_us, gain))
             .await
             .context("camera capture task panicked")?
     }
 
     fn capture_blocking(
         self: Arc<Self>,
-        interval: Duration,
+        fps: u32,
         shutter_us: Option<u32>,
         gain: Option<f32>,
     ) -> anyhow::Result<String> {
@@ -207,6 +218,7 @@ impl CameraManager {
         self.stop_pipeline(&mut inner);
 
         inner.last_error = None;
+        let fps = fps.clamp(1, 60);
         std::fs::create_dir_all(&self.capture_dir)
             .with_context(|| format!("create capture dir {}", self.capture_dir.display()))?;
         // Epoch-seconds name: unique, sortable, and needs no date formatting.
@@ -218,46 +230,76 @@ impl CameraManager {
         std::fs::create_dir(&run_dir)
             .with_context(|| format!("create run dir {}", run_dir.display()))?;
 
-        // 0 means auto exposure; a request that omits `shutter` uses the
-        // configured default, which may itself be auto.
+        // 0 means auto exposure; a request that omits `shutter`/`gain` uses
+        // the configured default, which may itself be auto.
         let shutter_us = shutter_us.unwrap_or(self.still.shutter_us);
         let gain = gain.unwrap_or(self.still.gain);
-        let mut args: Vec<String> = vec![
-            "--width".into(),
-            self.still.width.to_string(),
-            "--height".into(),
-            self.still.height.to_string(),
-            "--timeout".into(),
-            "0".into(),
-            "--timelapse".into(),
-            interval.as_millis().to_string(),
-            "--nopreview".into(),
-        ];
+
+        // Capture at native sensor resolution and center-crop to the
+        // requested output size, so output pixels are 1:1 sensor pixels with
+        // no ISP resampling. Fall back to letting the ISP scale if the output
+        // doesn't fit the sensor.
+        let src_stride = capture::Frame::stride_for(self.still.sensor_width);
+        let (capture_size, crop) = if self.still.width <= self.still.sensor_width
+            && self.still.height <= self.still.sensor_height
+        {
+            (
+                (self.still.sensor_width, self.still.sensor_height),
+                crate::stillrec::Crop::centered(
+                    self.still.sensor_width,
+                    self.still.sensor_height,
+                    src_stride,
+                    self.still.width,
+                    self.still.height,
+                ),
+            )
+        } else {
+            ((self.still.width, self.still.height), None)
+        };
+        let crop = crop.unwrap_or_else(|| {
+            crate::stillrec::Crop::identity(
+                self.still.width,
+                self.still.height,
+                capture::Frame::stride_for(self.still.width),
+            )
+        });
+
+        let stopping = Arc::new(AtomicBool::new(false));
+        let camera_settings = capture::CameraSettings {
+            width: capture_size.0,
+            height: capture_size.1,
+            fps,
+        };
+        let mut extra: Vec<String> = Vec::new();
         if shutter_us > 0 {
-            args.push("--shutter".into());
-            args.push(shutter_us.to_string());
+            extra.push("--shutter".into());
+            extra.push(shutter_us.to_string());
         }
         if gain > 0.0 {
-            args.push("--gain".into());
-            args.push(gain.to_string());
+            extra.push("--gain".into());
+            extra.push(gain.to_string());
         }
-        // `--output` takes a value, so the path must follow it immediately:
-        // keep this pair last.
-        args.push("--output".into());
-        args.push(run_dir.join("img_%04d.jpg").to_string_lossy().into_owned());
-
-        let child = std::process::Command::new("rpicam-still")
-            .args(&args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .context("failed to launch rpicam-still (is rpicam-apps installed?)")?;
-        let mut child = child;
+        let (rx, mut child) = match capture::spawn(&camera_settings, Arc::clone(&stopping), &extra)
+        {
+            Ok(ok) => ok,
+            Err(e) => {
+                let msg = format!("failed to launch rpicam-vid: {e:#}");
+                inner.last_error = Some(msg.clone());
+                anyhow::bail!(msg);
+            }
+        };
+        if let Err(e) =
+            crate::stillrec::spawn(crop, run_dir, self.still.jpeg_quality, rx)
+        {
+            let msg = format!("failed to start recorder thread: {e}");
+            inner.last_error = Some(msg.clone());
+            anyhow::bail!(msg);
+        }
 
         std::thread::sleep(Duration::from_millis(300));
         if let Ok(Some(status)) = child.try_wait() {
             let msg =
-                format!("rpicam-still exited immediately: {status} (camera missing or in use?)");
+                format!("rpicam-vid exited immediately: {status} (camera missing or in use?)");
             tracing::error!("{msg}");
             inner.last_error = Some(msg.clone());
             anyhow::bail!(msg);
@@ -265,16 +307,18 @@ impl CameraManager {
 
         inner.pipeline = Some(Pipeline::Capturing {
             child,
+            stopping,
             run: run.clone(),
-            interval,
+            fps,
             shutter_us,
             gain,
         });
         let shutter_desc = if shutter_us > 0 { format!("{shutter_us} µs") } else { "auto".to_string() };
         let gain_desc = if gain > 0.0 { format!("{gain}") } else { "auto".to_string() };
         tracing::info!(
-            "camera started (capturing every {} ms, shutter {shutter_desc}, gain {gain_desc}, into {run})",
-            interval.as_millis()
+            "camera started (capturing {fps} fps as {}x{} JPEGs, shutter {shutter_desc}, gain {gain_desc}, into {run})",
+            self.still.width,
+            self.still.height,
         );
         Ok(run)
     }
@@ -300,7 +344,8 @@ impl CameraManager {
                 let _ = child.wait();
                 tracing::info!("camera stopped (streaming)");
             }
-            Some(Pipeline::Capturing { mut child, run, .. }) => {
+            Some(Pipeline::Capturing { mut child, stopping, run, .. }) => {
+                stopping.store(true, Ordering::SeqCst);
                 let _ = child.kill();
                 let _ = child.wait();
                 tracing::info!("camera stopped (capturing into {run})");
@@ -314,13 +359,13 @@ impl CameraManager {
     pub fn status(&self) -> CameraStatus {
         let mut inner = self.inner.lock().unwrap();
         self.reap(&mut inner);
-        let (mode, run, interval_secs, shutter_us, gain) = match &inner.pipeline {
+        let (mode, run, fps, shutter_us, gain) = match &inner.pipeline {
             None => (Mode::Stopped, None, None, None, None),
             Some(Pipeline::Streaming { .. }) => (Mode::Streaming, None, None, None, None),
-            Some(Pipeline::Capturing { run, interval, shutter_us, gain, .. }) => (
+            Some(Pipeline::Capturing { run, fps, shutter_us, gain, .. }) => (
                 Mode::Capturing,
                 Some(run.clone()),
-                Some(interval.as_secs_f64()),
+                Some(*fps),
                 Some(*shutter_us),
                 Some(*gain),
             ),
@@ -330,7 +375,7 @@ impl CameraManager {
             mode,
             run,
             images,
-            interval_secs,
+            fps,
             shutter_us,
             gain,
             error: inner.last_error.clone(),
@@ -340,8 +385,6 @@ impl CameraManager {
     /// If the child exited, remove the pipeline. An exit we did not cause is
     /// an error worth remembering and reporting.
     fn reap(&self, inner: &mut Inner) {
-        // Only the streaming pipeline has a reader thread that must be told
-        // about intentional stops; capture mode has no such flag.
         let Some(mut pipeline) = inner.pipeline.take() else {
             return;
         };
@@ -354,7 +397,7 @@ impl CameraManager {
             Ok(true) => {
                 let stopping = match &pipeline {
                     Pipeline::Streaming { stopping, .. } => stopping.load(Ordering::SeqCst),
-                    Pipeline::Capturing { .. } => false,
+                    Pipeline::Capturing { stopping, .. } => stopping.load(Ordering::SeqCst),
                 };
                 if !stopping {
                     let msg = "camera process exited unexpectedly".to_string();
@@ -504,9 +547,9 @@ impl CameraManager {
         Ok(())
     }
 
-    /// The capture interval used when a request doesn't specify one.
-    pub fn default_interval(&self) -> Duration {
-        self.still.interval
+    /// The capture rate used when a request doesn't specify one.
+    pub fn default_fps(&self) -> u32 {
+        self.still.fps
     }
 
     /// The exposure time used when a request doesn't specify one (0 = auto).

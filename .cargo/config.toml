@@ -1,0 +1,5 @@
+# Build libjpeg-turbo from the source bundled with turbojpeg-sys.
+# The system libturbojpeg (2.1.5) is too old for the TurboJPEG 3.x API that
+# turbojpeg-sys binds; vendoring keeps builds self-contained.
+[env]
+TURBOJPEG_SOURCE = "vendor"
