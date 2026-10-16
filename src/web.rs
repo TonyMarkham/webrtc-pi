@@ -52,6 +52,10 @@ async fn camera_start(State(state): State<AppState>) -> Response {
 struct CaptureQuery {
     /// Seconds between stills. Omit to use the server default.
     interval: Option<f64>,
+    /// Exposure time in microseconds; 0 = auto. Omit for the server default.
+    shutter: Option<u32>,
+    /// Analog gain; 0 = auto. Omit for the server default.
+    gain: Option<f32>,
 }
 
 async fn camera_capture(
@@ -74,7 +78,27 @@ async fn camera_capture(
     } else {
         interval
     };
-    match state.camera.capture(interval).await {
+    if let Some(s) = q.shutter {
+        if s > 1_000_000 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "shutter must be 0..1000000 microseconds" })),
+            )
+                .into_response();
+        }
+    }
+    if let Some(g) = q.gain {
+        if !(0.0..=32.0).contains(&g) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "gain must be 0..32" })),
+            )
+                .into_response();
+        }
+    }
+    let shutter = q.shutter.or_else(|| Some(state.camera.default_shutter_us()));
+    let gain = q.gain.or_else(|| Some(state.camera.default_gain()));
+    match state.camera.capture(interval, shutter, gain).await {
         Ok(run) => Json(serde_json::json!({ "mode": "capturing", "run": run })).into_response(),
         Err(e) => camera_error(e),
     }

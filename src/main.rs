@@ -54,6 +54,12 @@ struct Args {
     /// Default seconds between stills in capture mode.
     #[arg(long, default_value_t = 1.0)]
     capture_interval: f64,
+    /// Fixed exposure time in microseconds for capture mode (0 = auto).
+    #[arg(long, default_value_t = 0)]
+    shutter: u32,
+    /// Fixed analog gain for capture mode (0 = auto).
+    #[arg(long, default_value_t = 0.0)]
+    gain: f32,
 }
 
 #[tokio::main]
@@ -84,6 +90,8 @@ async fn main() -> anyhow::Result<()> {
         width: args.still_width,
         height: args.still_height,
         interval: Duration::from_secs_f64(args.capture_interval),
+        shutter_us: args.shutter,
+        gain: args.gain,
     };
     let camera = Arc::new(camera::CameraManager::new(
         camera_settings,

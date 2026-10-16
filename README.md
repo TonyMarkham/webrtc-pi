@@ -76,13 +76,15 @@ cargo run --release -- --help
 - `--capture-dir` — where capture runs are written (default `captures`)
 - `--still-width/--still-height` — still image size (default 1440x1080)
 - `--capture-interval` — default seconds between stills (default 1.0)
+- `--shutter` — fixed exposure in µs for stills (default 0 = auto)
+- `--gain` — fixed analog gain for stills (default 0 = auto)
 
 ### Camera control API
 
 | Route | Method | Effect |
 | --- | --- | --- |
 | `/camera/start` | POST | Switch to streaming. Idempotent. |
-| `/camera/capture?interval=1.0` | POST | Switch to capture mode: stop the live view and write JPEGs into a new run directory (`captures/run-<unix-seconds>/img_NNNN.jpg`). `interval` is optional (server default). |
+| `/camera/capture?interval=1.0&shutter=1000&gain=8` | POST | Switch to capture mode: stop the live view and write JPEGs into a new run directory (`captures/run-<unix-seconds>/img_NNNN.jpg`). `interval` (seconds), `shutter` (µs, 0 = auto) and `gain` (0 = auto) are optional; per-request values override the CLI defaults. Use a short shutter to freeze motion — the IMX296 is global-shutter, so blur is purely exposure time — and raise gain (or lighting) to compensate. |
 | `/camera/stop` | POST | Stop whichever mode is active. Idempotent. |
 | `/camera/status` | GET | `{"mode": "streaming"\|"capturing"\|"stopped"}`, plus `run`, `images`, `interval_secs` while capturing and `error` after a failure. |
 | `/images?limit=500` | GET | List saved stills, newest first. |

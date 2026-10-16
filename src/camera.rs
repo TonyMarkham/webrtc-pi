@@ -33,6 +33,13 @@ pub struct StillSettings {
     pub height: u32,
     /// Default gap between stills; overridable per request.
     pub interval: Duration,
+    /// Fixed exposure time in microseconds; 0 = auto. Short exposures freeze
+    /// motion (at the cost of gain/noise, since the IMX296 is global shutter
+    /// and blur is purely a function of exposure time).
+    pub shutter_us: u32,
+    /// Fixed analog gain; 0 = auto. The counterpart to `shutter_us`: short
+    /// exposures need more gain to stay bright.
+    pub gain: f32,
 }
 
 /// What the camera is currently doing.
@@ -57,6 +64,8 @@ enum Pipeline {
         /// Subdirectory of `capture_dir` this run writes into.
         run: String,
         interval: Duration,
+        shutter_us: u32,
+        gain: f32,
     },
 }
 
@@ -79,6 +88,10 @@ pub struct CameraStatus {
     pub images: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interval_secs: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shutter_us: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gain: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -171,14 +184,24 @@ impl CameraManager {
     /// Start a capture run: stop any current mode, then run
     /// `rpicam-still --timelapse`, writing JPEGs into a fresh run directory.
     /// Idempotent only in the sense that it always begins a *new* run.
-    pub async fn capture(self: &Arc<Self>, interval: Duration) -> anyhow::Result<String> {
+    pub async fn capture(
+        self: &Arc<Self>,
+        interval: Duration,
+        shutter_us: Option<u32>,
+        gain: Option<f32>,
+    ) -> anyhow::Result<String> {
         let manager = Arc::clone(self);
-        tokio::task::spawn_blocking(move || manager.capture_blocking(interval))
+        tokio::task::spawn_blocking(move || manager.capture_blocking(interval, shutter_us, gain))
             .await
             .context("camera capture task panicked")?
     }
 
-    fn capture_blocking(self: Arc<Self>, interval: Duration) -> anyhow::Result<String> {
+    fn capture_blocking(
+        self: Arc<Self>,
+        interval: Duration,
+        shutter_us: Option<u32>,
+        gain: Option<f32>,
+    ) -> anyhow::Result<String> {
         let mut inner = self.inner.lock().unwrap();
         self.reap(&mut inner);
         self.stop_pipeline(&mut inner);
@@ -195,21 +218,36 @@ impl CameraManager {
         std::fs::create_dir(&run_dir)
             .with_context(|| format!("create run dir {}", run_dir.display()))?;
 
-        let output = run_dir.join("img_%04d.jpg");
+        // 0 means auto exposure; a request that omits `shutter` uses the
+        // configured default, which may itself be auto.
+        let shutter_us = shutter_us.unwrap_or(self.still.shutter_us);
+        let gain = gain.unwrap_or(self.still.gain);
+        let mut args: Vec<String> = vec![
+            "--width".into(),
+            self.still.width.to_string(),
+            "--height".into(),
+            self.still.height.to_string(),
+            "--timeout".into(),
+            "0".into(),
+            "--timelapse".into(),
+            interval.as_millis().to_string(),
+            "--nopreview".into(),
+        ];
+        if shutter_us > 0 {
+            args.push("--shutter".into());
+            args.push(shutter_us.to_string());
+        }
+        if gain > 0.0 {
+            args.push("--gain".into());
+            args.push(gain.to_string());
+        }
+        // `--output` takes a value, so the path must follow it immediately:
+        // keep this pair last.
+        args.push("--output".into());
+        args.push(run_dir.join("img_%04d.jpg").to_string_lossy().into_owned());
+
         let child = std::process::Command::new("rpicam-still")
-            .args([
-                "--width",
-                &self.still.width.to_string(),
-                "--height",
-                &self.still.height.to_string(),
-                "--timeout",
-                "0",
-                "--timelapse",
-                &format!("{}", interval.as_millis()),
-                "--nopreview",
-                "--output",
-            ])
-            .arg(&output)
+            .args(&args)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
@@ -225,9 +263,17 @@ impl CameraManager {
             anyhow::bail!(msg);
         }
 
-        inner.pipeline = Some(Pipeline::Capturing { child, run: run.clone(), interval });
+        inner.pipeline = Some(Pipeline::Capturing {
+            child,
+            run: run.clone(),
+            interval,
+            shutter_us,
+            gain,
+        });
+        let shutter_desc = if shutter_us > 0 { format!("{shutter_us} µs") } else { "auto".to_string() };
+        let gain_desc = if gain > 0.0 { format!("{gain}") } else { "auto".to_string() };
         tracing::info!(
-            "camera started (capturing every {} ms into {run})",
+            "camera started (capturing every {} ms, shutter {shutter_desc}, gain {gain_desc}, into {run})",
             interval.as_millis()
         );
         Ok(run)
@@ -268,12 +314,16 @@ impl CameraManager {
     pub fn status(&self) -> CameraStatus {
         let mut inner = self.inner.lock().unwrap();
         self.reap(&mut inner);
-        let (mode, run, interval_secs) = match &inner.pipeline {
-            None => (Mode::Stopped, None, None),
-            Some(Pipeline::Streaming { .. }) => (Mode::Streaming, None, None),
-            Some(Pipeline::Capturing { run, interval, .. }) => {
-                (Mode::Capturing, Some(run.clone()), Some(interval.as_secs_f64()))
-            }
+        let (mode, run, interval_secs, shutter_us, gain) = match &inner.pipeline {
+            None => (Mode::Stopped, None, None, None, None),
+            Some(Pipeline::Streaming { .. }) => (Mode::Streaming, None, None, None, None),
+            Some(Pipeline::Capturing { run, interval, shutter_us, gain, .. }) => (
+                Mode::Capturing,
+                Some(run.clone()),
+                Some(interval.as_secs_f64()),
+                Some(*shutter_us),
+                Some(*gain),
+            ),
         };
         let images = run.as_ref().map(|run| self.count_images(run));
         CameraStatus {
@@ -281,6 +331,8 @@ impl CameraManager {
             run,
             images,
             interval_secs,
+            shutter_us,
+            gain,
             error: inner.last_error.clone(),
         }
     }
@@ -455,5 +507,15 @@ impl CameraManager {
     /// The capture interval used when a request doesn't specify one.
     pub fn default_interval(&self) -> Duration {
         self.still.interval
+    }
+
+    /// The exposure time used when a request doesn't specify one (0 = auto).
+    pub fn default_shutter_us(&self) -> u32 {
+        self.still.shutter_us
+    }
+
+    /// The gain used when a request doesn't specify one (0 = auto).
+    pub fn default_gain(&self) -> f32 {
+        self.still.gain
     }
 }
