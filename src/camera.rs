@@ -322,13 +322,17 @@ impl CameraManager {
     // ---- capture directory helpers -------------------------------------
 
     /// Resolve a `/`-separated path relative to the capture directory,
-    /// refusing traversal outside it.
+    /// refusing traversal outside it. The base may have been configured as a
+    /// relative path, so canonicalize both sides before comparing.
     fn resolve(&self, path: &str) -> Option<PathBuf> {
         if path.is_empty() || path.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
             return None;
         }
+        let base = self.capture_dir.canonicalize().ok()?;
         let full = self.capture_dir.join(path);
-        full.canonicalize().ok().filter(|c| c.starts_with(&self.capture_dir))
+        full.canonicalize()
+            .ok()
+            .filter(|c| c.starts_with(&base))
     }
 
     /// Latest saved stills, newest first.
