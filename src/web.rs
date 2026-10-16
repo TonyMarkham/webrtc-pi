@@ -1,15 +1,21 @@
-//! HTTP server: serves the embedded viewer page and the WebSocket signaling
-//! endpoint used to exchange SDP offers/answers.
+//! HTTP server: serves the embedded viewer page, the WebSocket signaling
+//! endpoint used to exchange SDP offers/answers, the camera mode controls,
+//! and download access to the captured stills.
 
-use axum::extract::State;
+use std::time::Duration;
+
+use axum::body::Body;
+use axum::extract::{Query, State};
+use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Json;
-use axum::Router;
+use axum::{Json, Router};
+use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::watch;
 
+use crate::camera;
 use crate::session;
 use crate::state::AppState;
 
@@ -20,8 +26,12 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/ws", get(ws_handler))
         .route("/camera/start", post(camera_start))
+        .route("/camera/capture", post(camera_capture))
         .route("/camera/stop", post(camera_stop))
         .route("/camera/status", get(camera_status))
+        .route("/images", get(images_list).delete(image_delete))
+        .route("/images/file", get(image_file))
+        .route("/images/archive.tar", get(images_tar))
         .with_state(state)
 }
 
@@ -29,28 +39,180 @@ async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
+// ---- camera mode control --------------------------------------------------
+
 async fn camera_start(State(state): State<AppState>) -> Response {
     match state.camera.start().await {
-        Ok(()) => Json(serde_json::json!({ "running": true })).into_response(),
+        Ok(()) => Json(serde_json::json!({ "mode": "streaming" })).into_response(),
+        Err(e) => camera_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct CaptureQuery {
+    /// Seconds between stills. Omit to use the server default.
+    interval: Option<f64>,
+}
+
+async fn camera_capture(
+    State(state): State<AppState>,
+    Query(q): Query<CaptureQuery>,
+) -> Response {
+    let interval = match q.interval {
+        Some(secs) if (0.05..=3600.0).contains(&secs) => Duration::from_secs_f64(secs),
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "interval must be 0.05..3600 seconds" })),
+            )
+                .into_response()
+        }
+        None => Duration::ZERO, // use the server default
+    };
+    let interval = if interval.is_zero() {
+        state.camera.default_interval()
+    } else {
+        interval
+    };
+    match state.camera.capture(interval).await {
+        Ok(run) => Json(serde_json::json!({ "mode": "capturing", "run": run })).into_response(),
+        Err(e) => camera_error(e),
+    }
+}
+
+async fn camera_stop(State(state): State<AppState>) -> Response {
+    state.camera.stop().await;
+    Json(serde_json::json!({ "mode": "stopped" })).into_response()
+}
+
+async fn camera_status(State(state): State<AppState>) -> Json<camera::CameraStatus> {
+    Json(state.camera.status())
+}
+
+fn camera_error(e: anyhow::Error) -> Response {
+    tracing::warn!("camera request failed: {e:#}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": e.to_string() })),
+    )
+        .into_response()
+}
+
+// ---- captured stills -------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ImagesQuery {
+    /// Max entries (default 500, capped at 5000).
+    limit: Option<usize>,
+}
+
+async fn images_list(State(state): State<AppState>, Query(q): Query<ImagesQuery>) -> Response {
+    let limit = q.limit.unwrap_or(500).min(5000);
+    Json(state.camera.list_images(limit)).into_response()
+}
+
+#[derive(Deserialize)]
+struct ImagePathQuery {
+    path: String,
+}
+
+async fn image_file(
+    State(state): State<AppState>,
+    Query(q): Query<ImagePathQuery>,
+) -> Response {
+    let name = q.path.rsplit('/').next().unwrap_or("image.jpg").to_owned();
+    match state.camera.open_image(&q.path) {
+        Ok(file) => {
+            let stream = file_body(file);
+            let headers = [
+                (header::CONTENT_TYPE, "image/jpeg".to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{name}\""),
+                ),
+            ];
+            (headers, stream).into_response()
+        }
         Err(e) => {
-            tracing::warn!("camera start failed: {e:#}");
+            tracing::info!("image fetch failed: {e:#}");
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": e.to_string() })))
+                .into_response()
+        }
+    }
+}
+
+/// Read a std file on the blocking pool, yielding chunks as a response body.
+fn file_body(file: std::fs::File) -> Body {
+    use std::io::Read;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, String>>(8);
+    tokio::task::spawn_blocking(move || {
+        let mut file = file;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.blocking_send(Ok(Bytes::copy_from_slice(&buf[..n]))).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e.to_string()));
+                    break;
+                }
+            }
+        }
+    });
+    Body::from_stream(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }))
+}
+
+/// Stream a whole capture run as a tar archive.
+async fn images_tar(
+    State(state): State<AppState>,
+    Query(q): Query<ImagePathQuery>,
+) -> Response {
+    let manager = std::sync::Arc::clone(&state.camera);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, String>>(16);
+    let run = q.path;
+    let run_name = run.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = manager.tar_run(&run_name, tx.clone()) {
+            let _ = tx.blocking_send(Err(format!("{e:#}")));
+        }
+    });
+    let body = Body::from_stream(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }));
+    let headers = [
+        (header::CONTENT_TYPE, "application/x-tar".to_string()),
+        (
+            header::CONTENT_DISPOSITION,
+            format!(
+                "attachment; filename=\"{}.tar\"",
+                run.rsplit('/').next().unwrap_or("run")
+            ),
+        ),
+    ];
+    (headers, body).into_response()
+}
+
+async fn image_delete(State(state): State<AppState>, Query(q): Query<ImagePathQuery>) -> Response {
+    match state.camera.delete(&q.path) {
+        Ok(()) => Json(serde_json::json!({ "deleted": q.path })).into_response(),
+        Err(e) => {
+            tracing::info!("delete failed: {e:#}");
             (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "running": false, "error": e.to_string() })),
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": e.to_string() })),
             )
                 .into_response()
         }
     }
 }
 
-async fn camera_stop(State(state): State<AppState>) -> Response {
-    state.camera.stop().await;
-    Json(serde_json::json!({ "running": false })).into_response()
-}
-
-async fn camera_status(State(state): State<AppState>) -> Json<crate::camera::CameraStatus> {
-    Json(state.camera.status())
-}
+// ---- websocket signaling ---------------------------------------------------
 
 #[derive(Deserialize)]
 struct SignalMessage {
@@ -63,22 +225,22 @@ async fn ws_handler(ws: axum::extract::ws::WebSocketUpgrade, State(state): State
 }
 
 async fn handle_socket(socket: axum::extract::ws::WebSocket, state: AppState) {
-    use axum::extract::ws::Message;
-
     let (mut sender, mut receiver) = socket.split();
 
     // Wait for the browser's offer (non-trickle: gathered candidates are
     // included in the SDP itself).
     let offer = loop {
         match receiver.next().await {
-            Some(Ok(Message::Text(text))) => match serde_json::from_str::<SignalMessage>(&text) {
-                Ok(msg) if msg.r#type == "offer" => break msg.sdp,
-                Ok(_) => continue,
-                Err(e) => {
-                    tracing::info!("bad signaling message: {e}");
-                    return;
+            Some(Ok(axum::extract::ws::Message::Text(text))) => {
+                match serde_json::from_str::<SignalMessage>(&text) {
+                    Ok(msg) if msg.r#type == "offer" => break msg.sdp,
+                    Ok(_) => continue,
+                    Err(e) => {
+                        tracing::info!("bad signaling message: {e}");
+                        return;
+                    }
                 }
-            },
+            }
             Some(Ok(_)) => continue,
             Some(Err(e)) => {
                 tracing::info!("websocket error before offer: {e}");
@@ -92,7 +254,7 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, state: AppState) {
     let mut stream_task = match session::start(&state, offer, shutdown_rx.clone()).await {
         Ok((answer_sdp, handle)) => {
             let answer = serde_json::json!({ "type": "answer", "sdp": answer_sdp });
-            if let Err(e) = sender.send(Message::text(answer.to_string())).await {
+            if let Err(e) = sender.send(axum::extract::ws::Message::text(answer.to_string())).await {
                 tracing::info!("failed to send answer: {e}");
                 let _ = shutdown_tx.send(true);
                 let _ = handle.await;
@@ -104,7 +266,7 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, state: AppState) {
         Err(e) => {
             tracing::error!("negotiation failed: {e}");
             let _ = sender
-                .send(Message::text(
+                .send(axum::extract::ws::Message::text(
                     serde_json::json!({ "type": "error", "sdp": e.to_string() }).to_string(),
                 ))
                 .await;

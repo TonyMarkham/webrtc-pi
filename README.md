@@ -53,6 +53,14 @@ cargo run --release
 
 The server starts with the camera **stopped**; use `--auto-start` to capture
 from boot, or `POST /camera/start` (the viewer page has buttons for this).
+The camera is a mutually exclusive resource, so the server has three modes:
+
+- **streaming** — live H.264 view in the browser (`rpicam-vid` + x264)
+- **capturing** — continuous full-res stills to disk (`rpicam-still
+  --timelapse`); the live view is necessarily off
+- **stopped** — idle
+
+Starting one mode stops the other.
 
 Options:
 
@@ -60,24 +68,32 @@ Options:
 cargo run --release -- --help
 ```
 
-- `--width/--height` — capture size (default 1280x720)
+- `--width/--height` — capture size for streaming (default 1280x720)
 - `--fps` — capture/encode framerate (default 30)
 - `--bitrate` — H.264 target bitrate in kbps (default 2500)
 - `--port` — HTTP port (default 8080)
-- `--auto-start` — start the camera pipeline at boot
+- `--auto-start` — start streaming at boot
+- `--capture-dir` — where capture runs are written (default `captures`)
+- `--still-width/--still-height` — still image size (default 1440x1080)
+- `--capture-interval` — default seconds between stills (default 1.0)
 
 ### Camera control API
 
 | Route | Method | Effect |
 | --- | --- | --- |
-| `/camera/start` | POST | Start capture + encode. Idempotent. `500` with an `error` field if the camera fails to come up. |
-| `/camera/stop` | POST | Stop capture + encode. Idempotent. |
-| `/camera/status` | GET | `{"running": true}` or `{"running": false, "error": "..."}` |
+| `/camera/start` | POST | Switch to streaming. Idempotent. |
+| `/camera/capture?interval=1.0` | POST | Switch to capture mode: stop the live view and write JPEGs into a new run directory (`captures/run-<unix-seconds>/img_NNNN.jpg`). `interval` is optional (server default). |
+| `/camera/stop` | POST | Stop whichever mode is active. Idempotent. |
+| `/camera/status` | GET | `{"mode": "streaming"\|"capturing"\|"stopped"}`, plus `run`, `images`, `interval_secs` while capturing and `error` after a failure. |
+| `/images?limit=500` | GET | List saved stills, newest first. |
+| `/images/file?path=<run/img.jpg>` | GET | Download one image. |
+| `/images/archive.tar?path=<run>` | GET | Stream one run as a tar archive. |
+| `/images?path=<run-or-file>` | DELETE | Delete a run directory or single image. |
 
 The broadcast channel survives restarts: viewers connected while the camera is
-stopped simply wait (and start decoding on the next keyframe, within ~2 s of a
-start). If `rpicam-vid` dies unexpectedly the server stays up and reports the
-failure via `/camera/status`.
+stopped or capturing simply wait (and start decoding on the next keyframe,
+within ~2 s of returning to streaming mode). If the camera process dies
+unexpectedly the server stays up and reports the failure via `/camera/status`.
 
 Set `RUST_LOG=debug` for verbose logging. Works over the LAN with host
 candidates only; the Google STUN server is included for wider routability.
@@ -88,8 +104,7 @@ candidates only; the Google STUN server is included for wider routability.
 - Keyframe requests (PLI) from browsers are not acted upon; the encoder emits
   a keyframe every 2 seconds instead. A custom interceptor could forward PLIs
   to the encoder (`rtcp-processing` example in webrtc-rs shows how).
-- The camera can now be stopped when idle (`POST /camera/stop`), but it does
-  not pause by itself with zero viewers; an auto-idle policy could build on
-  that.
+- Capture mode writes JPEGs until stopped; there is no automatic disk cap and
+  no thumbnails (the gallery serves full-size images, fine over a LAN).
 - One media track per viewer; a switching/SFU design would share encoded
   packets across peer connections.

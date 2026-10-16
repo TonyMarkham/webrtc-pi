@@ -28,24 +28,27 @@ build time.
 ## Architecture
 
 ```
-camera.rs    CameraManager: starts/stops the capture+encode pipeline on
-             demand (POST /camera/start, /camera/stop, GET /camera/status,
-             or --auto-start at boot); owns the rpicam-vid child handle
+camera.rs    CameraManager: mode machine (stopped/streaming/capturing) that
+             owns the camera process handles; starts rpicam-vid+x264 for
+             streaming or rpicam-still --timelapse for full-res stills;
+             also serves image listing/download/tar/delete for capture runs
 capture.rs   spawns rpicam-vid --codec yuv420, reads exact-size I420 frames
              from stdout on a dedicated thread (std::sync::mpsc)
 encode.rs    x264 encoder thread: I420 -> H.264 Annex-B, publishes frames on
              a tokio broadcast channel; prepends SPS/PPS to every keyframe
 session.rs   one webrtc-rs PeerConnection per viewer: negotiation, track
              with its own SSRC, streams broadcast frames to the track
-web.rs       axum: GET / (embedded page), GET /ws (signaling),
-             POST /camera/{start,stop}, GET /camera/status
+web.rs       axum: GET / (embedded page + gallery), GET /ws (signaling),
+             /camera/{start,capture,stop,status}, /images[...]
 state.rs     shared AppState (broadcast sender + CameraManager)
 ```
 
 Data flow is single-producer/multi-consumer: capture → encoder thread →
 `broadcast::Sender<Arc<EncodedFrame>>` → one subscriber task per viewer.
 The broadcast channel is created at boot and survives pipeline restarts, so
-viewers may be connected while the camera is stopped (they wait for frames).
+viewers may be connected while the camera is stopped or capturing (they wait
+for frames). The camera is exclusive: entering capture mode kills the
+streaming pipeline and vice versa.
 
 ## Critical constraints — read before changing media code
 
@@ -78,10 +81,11 @@ viewers may be connected while the camera is stopped (they wait for frames).
 - Threads for blocking work (capture reads, x264), tokio for everything
   async. Don't do blocking I/O in async tasks.
 - The camera pipeline is the failure point, but the server must survive it:
-  if `rpicam-vid` dies unexpectedly, the process stays up and the failure is
-  reported by `GET /camera/status` (restart via `POST /camera/start`). Never
-  kill the process from the capture path — the HTTP API is the recovery
-  mechanism. `--auto-start` only affects boot-time startup.
+  if the camera process (`rpicam-vid` or `rpicam-still`) dies unexpectedly,
+  the process stays up and the failure is reported by `GET /camera/status`
+  (restart via the API). Never kill the process from the capture path — the
+  HTTP API is the recovery mechanism. A `--zsl` warning from `rpicam-still`
+  is informational (temporal denoise is skipped in timelapse mode).
 
 ## Testing
 

@@ -12,7 +12,9 @@ mod session;
 mod state;
 mod web;
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
@@ -40,6 +42,18 @@ struct Args {
     /// `POST /camera/start`.
     #[arg(long)]
     auto_start: bool,
+    /// Directory where capture runs are written.
+    #[arg(long, default_value = "captures")]
+    capture_dir: String,
+    /// Still image width (capture mode).
+    #[arg(long, default_value_t = 1440)]
+    still_width: u32,
+    /// Still image height (capture mode).
+    #[arg(long, default_value_t = 1080)]
+    still_height: u32,
+    /// Default seconds between stills in capture mode.
+    #[arg(long, default_value_t = 1.0)]
+    capture_interval: f64,
 }
 
 #[tokio::main]
@@ -66,9 +80,16 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let (frames_tx, _) = broadcast::channel::<Arc<encode::EncodedFrame>>(64);
+    let still = camera::StillSettings {
+        width: args.still_width,
+        height: args.still_height,
+        interval: Duration::from_secs_f64(args.capture_interval),
+    };
     let camera = Arc::new(camera::CameraManager::new(
         camera_settings,
         encoder_settings,
+        still,
+        PathBuf::from(&args.capture_dir),
         frames_tx.clone(),
     ));
 
