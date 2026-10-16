@@ -30,9 +30,9 @@ preset + `zerolatency` tune keep encoding latency to a frame or two.
 ## Setup (on the Pi)
 
 ```sh
-# 1. System packages: C toolchain, x264 headers, camera apps
+# 1. System packages: C toolchain, x264 headers, camera apps, clang (for bindgen)
 sudo apt update
-sudo apt install -y build-essential pkg-config libx264-dev rpicam-apps
+sudo apt install -y build-essential pkg-config libx264-dev rpicam-apps libclang-dev
 
 # Make sure your user can access the camera
 sudo usermod -aG video,gpio $USER   # log out/in afterwards
