@@ -5,6 +5,7 @@
 //! webrtc-rs peer connection per viewer. Viewers connect with any browser
 //! at `http://<pi>:<port>/`; signaling happens over a WebSocket at `/ws`.
 
+mod camera;
 mod capture;
 mod encode;
 mod session;
@@ -13,6 +14,7 @@ mod web;
 
 use std::sync::Arc;
 
+use anyhow::Context;
 use clap::Parser;
 use tokio::sync::broadcast;
 
@@ -34,6 +36,10 @@ struct Args {
     /// HTTP/WebSocket listen port.
     #[arg(long, default_value_t = 8080)]
     port: u16,
+    /// Start the camera pipeline at boot instead of waiting for
+    /// `POST /camera/start`.
+    #[arg(long)]
+    auto_start: bool,
 }
 
 #[tokio::main]
@@ -47,23 +53,37 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let camera = capture::CameraSettings {
+    let camera_settings = capture::CameraSettings {
         width: args.width,
         height: args.height,
         fps: args.fps,
     };
-    let encoder = encode::EncoderSettings {
+    let encoder_settings = encode::EncoderSettings {
         width: args.width,
         height: args.height,
         fps: args.fps,
         bitrate_kbps: args.bitrate,
     };
 
-    let frames_rx = capture::spawn(&camera)?;
     let (frames_tx, _) = broadcast::channel::<Arc<encode::EncodedFrame>>(64);
-    encode::spawn(encoder, frames_rx, frames_tx.clone())?;
+    let camera = Arc::new(camera::CameraManager::new(
+        camera_settings,
+        encoder_settings,
+        frames_tx.clone(),
+    ));
 
-    let state = state::AppState { frames: frames_tx };
+    if args.auto_start {
+        camera
+            .start()
+            .await
+            .context("failed to auto-start the camera pipeline")?;
+        tracing::info!("camera auto-started (--auto-start)");
+    }
+
+    let state = state::AppState {
+        frames: frames_tx,
+        camera,
+    };
     let app = web::router(state);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", args.port)).await?;

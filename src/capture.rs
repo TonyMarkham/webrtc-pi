@@ -6,8 +6,9 @@
 //! that by reading exactly one frame's worth of bytes at a time.
 
 use std::io::Read;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 
 use anyhow::Context;
 
@@ -27,8 +28,14 @@ impl CameraSettings {
 
 /// Spawn `rpicam-vid` and a dedicated reader thread.
 ///
-/// The returned channel receives one `Vec<u8>` per captured frame, laid out as I420.
-pub fn spawn(settings: &CameraSettings) -> anyhow::Result<mpsc::Receiver<Vec<u8>>> {
+/// The returned channel receives one `Vec<u8>` per captured frame, laid out as
+/// I420. The caller owns the child so it can stop the pipeline later; when it
+/// does, it must set `stopping` first so the reader thread treats the
+/// resulting EOF as intentional rather than a camera failure.
+pub fn spawn(
+    settings: &CameraSettings,
+    stopping: Arc<AtomicBool>,
+) -> anyhow::Result<(mpsc::Receiver<Vec<u8>>, Child)> {
     let frame_size = settings.frame_size();
     let mut child = Command::new("rpicam-vid")
         .args([
@@ -67,23 +74,23 @@ pub fn spawn(settings: &CameraSettings) -> anyhow::Result<mpsc::Receiver<Vec<u8>
                 match stdout.read_exact(&mut buf) {
                     Ok(()) => {
                         if tx.send(buf.clone()).is_err() {
-                            break; // encoder gone; server is shutting down
+                            break; // encoder gone; pipeline is shutting down
                         }
                     }
                     Err(e) => {
-                        tracing::error!("camera stream ended: {e}");
-                        std::process::exit(1);
+                        if stopping.load(Ordering::SeqCst) {
+                            tracing::info!("camera stream ended (stopped)");
+                        } else {
+                            // Do not exit the process: the HTTP API must stay
+                            // up so the camera can be restarted. The failure
+                            // is surfaced via the camera manager's status.
+                            tracing::error!("camera stream ended unexpectedly: {e}");
+                        }
+                        break;
                     }
                 }
             }
         })?;
 
-    // Reap the child if we ever exit; otherwise it would linger.
-    std::thread::Builder::new()
-        .name("camera-reap".into())
-        .spawn(move || {
-            let _ = child.wait();
-        })?;
-
-    Ok(rx)
+    Ok((rx, child))
 }

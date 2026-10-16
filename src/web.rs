@@ -2,8 +2,9 @@
 //! endpoint used to exchange SDP offers/answers.
 
 use axum::extract::State;
-use axum::response::{Html, Response};
-use axum::routing::get;
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::Json;
 use axum::Router;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -18,11 +19,37 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/ws", get(ws_handler))
+        .route("/camera/start", post(camera_start))
+        .route("/camera/stop", post(camera_stop))
+        .route("/camera/status", get(camera_status))
         .with_state(state)
 }
 
 async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
+}
+
+async fn camera_start(State(state): State<AppState>) -> Response {
+    match state.camera.start().await {
+        Ok(()) => Json(serde_json::json!({ "running": true })).into_response(),
+        Err(e) => {
+            tracing::warn!("camera start failed: {e:#}");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "running": false, "error": e.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn camera_stop(State(state): State<AppState>) -> Response {
+    state.camera.stop().await;
+    Json(serde_json::json!({ "running": false })).into_response()
+}
+
+async fn camera_status(State(state): State<AppState>) -> Json<crate::camera::CameraStatus> {
+    Json(state.camera.status())
 }
 
 #[derive(Deserialize)]

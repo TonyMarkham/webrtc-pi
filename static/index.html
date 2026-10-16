@@ -10,22 +10,58 @@
                  font-family: system-ui, sans-serif; display: flex;
                  flex-direction: column; }
     video { flex: 1; min-height: 0; width: 100%; object-fit: contain; background: #000; }
+    #bar { display: flex; gap: 10px; align-items: center; padding: 8px 14px; }
+    button { background: #2a2a2a; color: #ddd; border: 1px solid #444;
+             border-radius: 6px; padding: 6px 16px; font-size: 14px; cursor: pointer; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    #cam-status { font-size: 13px; color: #888; }
+    #cam-status.running { color: #7bd88f; }
+    #cam-status.error { color: #ff6b6b; }
     #status { padding: 8px 14px; font-size: 14px; }
     #status.error { color: #ff6b6b; }
     #status.ok { color: #7bd88f; }
   </style>
 </head>
 <body>
+  <div id="bar">
+    <button id="cam-start">Start camera</button>
+    <button id="cam-stop">Stop camera</button>
+    <span id="cam-status">checking&hellip;</span>
+  </div>
   <video id="video" autoplay muted playsinline></video>
   <div id="status">connecting&hellip;</div>
   <script>
     const video = document.getElementById('video');
     const status = document.getElementById('status');
+    const camStatus = document.getElementById('cam-status');
+    const startBtn = document.getElementById('cam-start');
+    const stopBtn = document.getElementById('cam-stop');
 
     function setStatus(text, cls) {
       status.textContent = text;
       status.className = cls || '';
     }
+
+    // Camera start/stop control, kept in sync with the server by polling.
+    async function refreshCameraStatus() {
+      try {
+        const s = await (await fetch('/camera/status')).json();
+        camStatus.textContent = s.running
+          ? 'camera running'
+          : (s.error ? 'camera failed: ' + s.error : 'camera stopped');
+        camStatus.className = s.running ? 'running' : (s.error ? 'error' : '');
+        startBtn.disabled = s.running;
+        stopBtn.disabled = !s.running;
+        if (!s.running) setStatus('camera is stopped — press “Start camera”', 'error');
+      } catch {
+        camStatus.textContent = 'status unavailable';
+        camStatus.className = 'error';
+      }
+    }
+    startBtn.onclick = () => { fetch('/camera/start', { method: 'POST' }).then(refreshCameraStatus); };
+    stopBtn.onclick = () => { fetch('/camera/stop', { method: 'POST' }).then(refreshCameraStatus); };
+    setInterval(refreshCameraStatus, 3000);
+    refreshCameraStatus();
 
     const pc = new RTCPeerConnection({
       iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]

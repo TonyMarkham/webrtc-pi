@@ -28,18 +28,24 @@ build time.
 ## Architecture
 
 ```
+camera.rs    CameraManager: starts/stops the capture+encode pipeline on
+             demand (POST /camera/start, /camera/stop, GET /camera/status,
+             or --auto-start at boot); owns the rpicam-vid child handle
 capture.rs   spawns rpicam-vid --codec yuv420, reads exact-size I420 frames
              from stdout on a dedicated thread (std::sync::mpsc)
 encode.rs    x264 encoder thread: I420 -> H.264 Annex-B, publishes frames on
              a tokio broadcast channel; prepends SPS/PPS to every keyframe
 session.rs   one webrtc-rs PeerConnection per viewer: negotiation, track
              with its own SSRC, streams broadcast frames to the track
-web.rs       axum: GET / (embedded page), GET /ws (signaling)
-state.rs     shared AppState (broadcast sender)
+web.rs       axum: GET / (embedded page), GET /ws (signaling),
+             POST /camera/{start,stop}, GET /camera/status
+state.rs     shared AppState (broadcast sender + CameraManager)
 ```
 
 Data flow is single-producer/multi-consumer: capture → encoder thread →
 `broadcast::Sender<Arc<EncodedFrame>>` → one subscriber task per viewer.
+The broadcast channel is created at boot and survives pipeline restarts, so
+viewers may be connected while the camera is stopped (they wait for frames).
 
 ## Critical constraints — read before changing media code
 
@@ -71,8 +77,11 @@ Data flow is single-producer/multi-consumer: capture → encoder thread →
   `println!` outside of `x264`'s own output).
 - Threads for blocking work (capture reads, x264), tokio for everything
   async. Don't do blocking I/O in async tasks.
-- The camera pipeline is the failure point: if `rpicam-vid` dies the process
-  exits non-zero on purpose (supervisors should restart it).
+- The camera pipeline is the failure point, but the server must survive it:
+  if `rpicam-vid` dies unexpectedly, the process stays up and the failure is
+  reported by `GET /camera/status` (restart via `POST /camera/start`). Never
+  kill the process from the capture path — the HTTP API is the recovery
+  mechanism. `--auto-start` only affects boot-time startup.
 
 ## Testing
 
