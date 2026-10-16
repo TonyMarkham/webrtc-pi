@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pi Camera</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { margin: 0; height: 100%; background: #111; color: #ddd;
+                 font-family: system-ui, sans-serif; display: flex;
+                 flex-direction: column; }
+    video { flex: 1; min-height: 0; width: 100%; object-fit: contain; background: #000; }
+    #status { padding: 8px 14px; font-size: 14px; }
+    #status.error { color: #ff6b6b; }
+    #status.ok { color: #7bd88f; }
+  </style>
+</head>
+<body>
+  <video id="video" autoplay muted playsinline></video>
+  <div id="status">connecting&hellip;</div>
+  <script>
+    const video = document.getElementById('video');
+    const status = document.getElementById('status');
+
+    function setStatus(text, cls) {
+      status.textContent = text;
+      status.className = cls || '';
+    }
+
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    });
+
+    pc.addTransceiver('video', { direction: 'recvonly' });
+
+    pc.ontrack = (e) => {
+      video.srcObject = e.streams[0];
+      video.play().catch(() => setStatus('tap/click to start playback'));
+    };
+    video.onplay = () => setStatus('streaming', 'ok');
+
+    pc.onconnectionstatechange = () => {
+      switch (pc.connectionState) {
+        case 'connecting': setStatus('negotiating…'); break;
+        case 'connected':  setStatus('peer connected, waiting for video…'); break;
+        case 'failed':     setStatus('connection failed — reload to retry', 'error'); break;
+        case 'disconnected':
+        case 'closed':     setStatus('disconnected — reload to reconnect', 'error'); break;
+      }
+    };
+
+    const ws = new WebSocket(`ws://${location.host}/ws`);
+
+    ws.onopen = async () => {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      // Non-trickle: wait for gathering (with a timeout fallback) so the
+      // SDP we send contains all candidates.
+      await new Promise((resolve) => {
+        if (pc.iceGatheringState === 'complete') return resolve();
+        const done = () => { pc.removeEventListener('icegatheringstatechange', done); resolve(); };
+        pc.addEventListener('icegatheringstatechange', () =>
+          pc.iceGatheringState === 'complete' && done());
+        setTimeout(done, 2000);
+      });
+      ws.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp }));
+      setStatus('offer sent, waiting for answer…');
+    };
+
+    ws.onmessage = async (e) => {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'answer') {
+        await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+        setStatus('connecting…');
+      } else if (msg.type === 'error') {
+        setStatus('server error: ' + msg.sdp, 'error');
+      }
+    };
+
+    ws.onclose = () => setStatus('signaling connection lost — reload to retry', 'error');
+  </script>
+</body>
+</html>
