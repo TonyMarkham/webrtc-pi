@@ -12,8 +12,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use gpui::{
-    div, img, prelude::*, px, rgb, size, App, Application, Bounds, Context, Image, ImageFormat,
-    ObjectFit, Render, SharedString, Window, WindowBounds, WindowOptions,
+    div, img, prelude::*, px, rgb, size, App, Application, Bounds, Context, CursorStyle,
+    Decorations, Image, ImageFormat, MouseButton, MouseDownEvent, ObjectFit, Render, ResizeEdge,
+    SharedString, Tiling, Window, WindowBounds, WindowDecorations, WindowOptions,
 };
 
 // Palette (dark).
@@ -632,19 +633,172 @@ impl CameraApp {
 }
 
 impl Render for CameraApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let content = div()
             .flex()
             .flex_col()
-            .size_full()
-            .bg(rgb(BG))
-            .text_color(rgb(TEXT))
+            .flex_1()
+            .min_h_0()
             .p_3()
             .gap_3()
             .child(self.render_header())
             .child(self.render_controls(cx))
             .child(self.render_preview())
-            .child(self.render_gallery(cx))
+            .child(self.render_gallery(cx));
+
+        let root = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(rgb(BG))
+            .text_color(rgb(TEXT));
+
+        match window.window_decorations() {
+            // The window manager draws the titlebar; nothing to do.
+            Decorations::Server => root.child(content),
+            // No server-side decorations available (Wayland compositors
+            // without SSD, X11 with a compositor): draw our own titlebar
+            // and resize edges.
+            Decorations::Client { tiling } => {
+                let controls = window.window_controls();
+                root.child(self.render_titlebar(controls.minimize, controls.maximize, cx))
+                    .child(content)
+                    .child(self.render_resize_edges(tiling, cx))
+            }
+        }
+    }
+}
+
+impl CameraApp {
+    /// A small client-side titlebar: drag region + window controls. Only
+    /// rendered when the platform reports client-side decorations.
+    fn render_titlebar(
+        &mut self,
+        can_minimize: bool,
+        can_maximize: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let control = |id: &'static str, glyph: &'static str| {
+            div()
+                .id(id)
+                .size_7()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+                .text_color(rgb(TEXT_DIM))
+                .child(glyph)
+        };
+        div()
+            .id("titlebar")
+            .flex()
+            .items_center()
+            .h_9()
+            .flex_none()
+            .bg(rgb(PANEL))
+            .on_mouse_down(MouseButton::Left, cx.listener(
+                |_, event: &MouseDownEvent, window, _| {
+                    // Double-click toggles maximize; single press hands the
+                    // window move to the compositor.
+                    if event.click_count >= 2 {
+                        window.zoom_window();
+                    } else {
+                        window.start_window_move();
+                    }
+                },
+            ))
+            .child(
+                div()
+                    .pl_3()
+                    .text_sm()
+                    .text_color(rgb(TEXT_DIM))
+                    .child("Pi Camera Control"),
+            )
+            .child(div().flex_1())
+            .when(can_minimize, |bar| {
+                bar.child(
+                    control("tb-min", "–")
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(BORDER)).text_color(rgb(TEXT)))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_click(|_, window, _| window.minimize_window()),
+                )
+            })
+            .when(can_maximize, |bar| {
+                bar.child(
+                    control("tb-max", "□")
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(BORDER)).text_color(rgb(TEXT)))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_click(|_, window, _| window.zoom_window()),
+                )
+            })
+            .child(
+                control("tb-close", "×")
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(ERROR)).text_color(rgb(0xffffff)))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_click(|_, window, _| window.remove_window()),
+            )
+            .into_any_element()
+    }
+
+    /// Invisible strips along the window edges that start compositor-driven
+    /// resize on press (incl. corners). Painted after the content so they
+    /// sit on top; skipped on tiled (snapped) edges.
+    fn render_resize_edges(&mut self, tiling: Tiling, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let strip = |id: &'static str,
+                     tiling_ok: bool,
+                     cursor: CursorStyle,
+                     edge: ResizeEdge,
+                     style: fn(gpui::Stateful<gpui::Div>) -> gpui::Stateful<gpui::Div>| {
+            let base = div()
+                .id(id)
+                .absolute()
+                .block_mouse_except_scroll()
+                .cursor(cursor)
+                .on_mouse_down(MouseButton::Left, cx.listener(move |_, _, window, _| {
+                    window.start_window_resize(edge);
+                }));
+            if tiling_ok {
+                style(base).into_any_element()
+            } else {
+                div().into_any_element()
+            }
+        };
+        div()
+            .child(strip("rz-top", !tiling.top, CursorStyle::ResizeUpDown, ResizeEdge::Top, |d| {
+                d.top_0().left_0().right_0().h_1p5()
+            }))
+            .child(strip("rz-bottom", !tiling.bottom, CursorStyle::ResizeUpDown, ResizeEdge::Bottom, |d| {
+                d.bottom_0().left_0().right_0().h_1p5()
+            }))
+            .child(strip("rz-left", !tiling.left, CursorStyle::ResizeLeftRight, ResizeEdge::Left, |d| {
+                d.top_0().bottom_0().left_0().w_1p5()
+            }))
+            .child(strip("rz-right", !tiling.right, CursorStyle::ResizeLeftRight, ResizeEdge::Right, |d| {
+                d.top_0().bottom_0().right_0().w_1p5()
+            }))
+            .child(strip("rz-tl", !(tiling.top || tiling.left), CursorStyle::ResizeUpLeftDownRight, ResizeEdge::TopLeft, |d| {
+                d.top_0().left_0().size_3()
+            }))
+            .child(strip("rz-tr", !(tiling.top || tiling.right), CursorStyle::ResizeUpRightDownLeft, ResizeEdge::TopRight, |d| {
+                d.top_0().right_0().size_3()
+            }))
+            .child(strip("rz-bl", !(tiling.bottom || tiling.left), CursorStyle::ResizeUpRightDownLeft, ResizeEdge::BottomLeft, |d| {
+                d.bottom_0().left_0().size_3()
+            }))
+            .child(strip("rz-br", !(tiling.bottom || tiling.right), CursorStyle::ResizeUpLeftDownRight, ResizeEdge::BottomRight, |d| {
+                d.bottom_0().right_0().size_3()
+            }))
+            .into_any_element()
     }
 }
 
@@ -690,6 +844,10 @@ fn main() {
                     title: Some("Pi Camera Control".into()),
                     ..Default::default()
                 }),
+                // Linux (Wayland/X11): draw our own titlebar; falls back to
+                // server decorations automatically where unavailable.
+                window_decorations: Some(WindowDecorations::Client),
+                window_min_size: Some(size(px(720.), px(540.))),
                 ..Default::default()
             },
             |_, cx| cx.new(|cx| CameraApp::new(client, cx)),
