@@ -9,6 +9,7 @@ mod camera;
 mod capture;
 mod derive;
 mod encode;
+mod preview;
 mod session;
 mod state;
 mod stillrec;
@@ -18,8 +19,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
+use bytes::Bytes;
 use clap::Parser;
 use tokio::sync::broadcast;
+use tokio::sync::watch;
 
 #[derive(Parser)]
 #[command(name = "webrtc-pi", about = "WebRTC camera streaming server for Raspberry Pi 5")]
@@ -96,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let (frames_tx, _) = broadcast::channel::<Arc<encode::EncodedFrame>>(64);
+    let (preview_tx, _) = watch::channel::<Option<Bytes>>(None);
     let still = camera::StillSettings {
         width: args.still_width,
         height: args.still_height,
@@ -112,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
         still,
         PathBuf::from(&args.capture_dir),
         frames_tx.clone(),
+        preview_tx.clone(),
     ));
 
     if args.auto_start {
@@ -124,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = state::AppState {
         frames: frames_tx,
+        preview: preview_tx,
         camera,
     };
     let app = web::router(state);

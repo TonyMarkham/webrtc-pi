@@ -6,13 +6,16 @@
 //! 2 seconds so new viewers can join without waiting for scene changes.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
+use bytes::Bytes;
 use x264::{Colorspace, Image, Plane, Preset, Setup, Tune};
 
 use crate::capture::Frame;
+use crate::preview;
 
 /// One encoded H.264 frame in Annex-B format.
 pub struct EncodedFrame {
@@ -32,18 +35,26 @@ pub struct EncoderSettings {
 
 /// Spawn the encoder thread. It consumes raw I420 frames and publishes
 /// encoded frames on the broadcast channel for every connected viewer.
+/// It also publishes a throttled JPEG preview on `preview` for the
+/// companion desktop app.
 pub fn spawn(
     settings: EncoderSettings,
     rx: mpsc::Receiver<Frame>,
     tx: broadcast::Sender<Arc<EncodedFrame>>,
+    preview_tx: watch::Sender<Option<Bytes>>,
 ) -> anyhow::Result<()> {
     std::thread::Builder::new()
         .name("x264-encode".into())
-        .spawn(move || run(settings, rx, tx))?;
+        .spawn(move || run(settings, rx, tx, preview_tx))?;
     Ok(())
 }
 
-fn run(settings: EncoderSettings, mut rx: mpsc::Receiver<Frame>, tx: broadcast::Sender<Arc<EncodedFrame>>) {
+fn run(
+    settings: EncoderSettings,
+    mut rx: mpsc::Receiver<Frame>,
+    tx: broadcast::Sender<Arc<EncodedFrame>>,
+    preview_tx: watch::Sender<Option<Bytes>>,
+) {
     let EncoderSettings {
         width,
         height,
@@ -72,6 +83,7 @@ fn run(settings: EncoderSettings, mut rx: mpsc::Receiver<Frame>, tx: broadcast::
 
     let frame_duration = Duration::from_nanos(1_000_000_000 / u64::from(fps));
     let mut pts: i64 = 0;
+    let mut last_preview = Instant::now() - preview::INTERVAL;
 
     loop {
         let frame = match rx.blocking_recv() {
@@ -131,5 +143,17 @@ fn run(settings: EncoderSettings, mut rx: mpsc::Receiver<Frame>, tx: broadcast::
             keyframe,
             duration: frame_duration,
         }));
+
+        // Throttled JPEG preview for the companion app. Failure here must
+        // never take down streaming, so it only logs.
+        if last_preview.elapsed() >= preview::INTERVAL {
+            last_preview = Instant::now();
+            match preview::encode(&frame, width, preview::QUALITY) {
+                Ok(jpeg) => {
+                    let _ = preview_tx.send(Some(Bytes::from(jpeg)));
+                }
+                Err(e) => tracing::warn!("preview encode failed: {e:#}"),
+            }
+        }
     }
 }

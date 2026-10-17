@@ -1,3 +1,12 @@
+[workspace]
+# The GPUI companion app is a member so dependency versions and the lockfile
+# stay unified, but it is excluded from the default build: it needs a desktop
+# GPU toolchain and is meant to be built on a workstation, not on the Pi.
+# Build it explicitly with `cargo build -p pi-control` (from the repo root or
+# the `app/` directory).
+members = ["app"]
+default-members = ["."]
+
 [package]
 name = "webrtc-pi"
 version = "0.1.0"

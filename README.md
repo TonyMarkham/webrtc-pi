@@ -26,6 +26,7 @@ preset + `zerolatency` tune keep encoding latency to a frame or two.
 | WebRTC | [`webrtc-rs`](https://github.com/webrtc-rs/webrtc) 0.21 |
 | Signaling | Embedded page + WebSocket (`/ws`), non-trickle SDP exchange |
 | HTTP | `axum` |
+| Companion app | [`gpui`](https://gpui.rs) desktop client (`app/`, cross-platform; polls the HTTP API and a low-rate JPEG preview) |
 
 ## Setup (on the Pi)
 
@@ -100,6 +101,7 @@ At 30 fps a run writes ~180 KB/frame ≈ 5 MB/s ≈ 19 GB/hour.
 | `/images/file?path=<run/img.jpg>` | GET | Download one image. |
 | `/images/archive.tar?path=<run>` | GET | Stream one run as a tar archive. |
 | `/images?path=<run-or-file>` | DELETE | Delete a run directory or single image. |
+| `/preview.jpg` | GET | Latest low-rate preview JPEG for the companion app: an encoder tap (~2 fps, 640-wide) while streaming, the newest still of the current run while capturing. 503 when the camera is stopped. |
 
 The broadcast channel survives restarts: viewers connected while the camera is
 stopped or capturing simply wait (and start decoding on the next keyframe,
@@ -108,6 +110,31 @@ unexpectedly the server stays up and reports the failure via `/camera/status`.
 
 Set `RUST_LOG=debug` for verbose logging. Works over the LAN with host
 candidates only; the Google STUN server is included for wider routability.
+
+### Companion desktop app (`pi-control`)
+
+The repository also contains a cross-platform [GPUI](https://gpui.rs) desktop
+app in [`app/`](app/) that acts as a remote control for the server: camera
+mode buttons, capture parameter steppers (fps / shutter / gain), a live
+preview pane (fed by `/preview.jpg`, ~2 fps while streaming, newest still
+while capturing), and a capture gallery with per-run tar download, per-image
+open-in-browser and delete.
+
+The app is a workspace member but **not** part of the default build, since it
+needs a desktop GPU stack and is meant to be built on a workstation, not on
+the Pi. From a checkout of this repository on macOS/Linux/Windows:
+
+```sh
+cargo run -p pi-control -- --server http://<pi-ip>:8080
+# or: export PI_SERVER=http://<pi-ip>:8080
+```
+
+GPUI's Linux build additionally needs the usual GUI dev packages
+(`libwayland-dev`, `libxkbcommon-dev`, `libfontconfig1-dev`, `libasound2-dev`,
+`libudev-dev` and friends; on macOS/Windows no extras are required).
+
+Note that the live H.264 stream itself stays in the browser — the app
+deliberately does not speak WebRTC; it is for control and monitoring.
 
 ### Deriving training-data variants
 

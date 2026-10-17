@@ -22,6 +22,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use serde::Serialize;
 use tokio::sync::broadcast;
+use tokio::sync::watch;
 
 use crate::capture::{self, CameraSettings};
 use crate::derive;
@@ -138,6 +139,8 @@ pub struct CameraManager {
     /// Encoded frames published by the (current) encoder thread. Created once,
     /// shared across streaming restarts.
     frames: broadcast::Sender<Arc<EncodedFrame>>,
+    /// Latest preview JPEG published by the (current) encoder thread.
+    preview: watch::Sender<Option<Bytes>>,
     inner: Mutex<Inner>,
     /// Serializes variant derivation so concurrent tar downloads of the same
     /// fresh run don't derive it twice.
@@ -151,6 +154,7 @@ impl CameraManager {
         still: StillSettings,
         capture_dir: PathBuf,
         frames: broadcast::Sender<Arc<EncodedFrame>>,
+        preview: watch::Sender<Option<Bytes>>,
     ) -> Self {
         Self {
             camera,
@@ -158,6 +162,7 @@ impl CameraManager {
             still,
             capture_dir,
             frames,
+            preview,
             inner: Mutex::new(Inner::default()),
             deriving: Mutex::new(()),
         }
@@ -191,7 +196,7 @@ impl CameraManager {
                     anyhow::bail!(msg);
                 }
             };
-        encode::spawn(self.encoder, rx, self.frames.clone())?;
+        encode::spawn(self.encoder, rx, self.frames.clone(), self.preview.clone())?;
 
         // rpicam-vid can die immediately (camera busy, no camera attached).
         // Give it a moment so `start` surfaces that instead of lying.
@@ -578,6 +583,26 @@ impl CameraManager {
         }
         builder.finish().context("failed to finish archive")?;
         Ok(())
+    }
+
+    /// The most recent still of the current capture run, for the preview
+    /// endpoint. `None` unless capturing.
+    pub fn latest_still(&self) -> Option<PathBuf> {
+        let run = self.status().run?;
+        let dir = self.resolve(&run)?;
+        let mut best: Option<(String, PathBuf)> = None;
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "jpg") {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                // Names are `img_XXXXXX.jpg`, so lexicographic order is
+                // numeric order.
+                if best.as_ref().is_none_or(|(bn, _)| name > *bn) {
+                    best = Some((name, path));
+                }
+            }
+        }
+        best.map(|(_, path)| path)
     }
 
     /// The capture rate used when a request doesn't specify one.

@@ -30,6 +30,7 @@ pub fn router(state: AppState) -> Router {
         .route("/images", get(images_list).delete(image_delete))
         .route("/images/file", get(image_file))
         .route("/images/archive.tar", get(images_tar))
+        .route("/preview.jpg", get(preview_jpg))
         .with_state(state)
 }
 
@@ -226,6 +227,38 @@ async fn image_delete(State(state): State<AppState>, Query(q): Query<ImagePathQu
                 .into_response()
         }
     }
+}
+
+// ---- live preview for the companion app ------------------------------------
+
+/// Latest low-rate JPEG preview: the encoder's tap while streaming, or the
+/// newest still of the current run while capturing.
+async fn preview_jpg(State(state): State<AppState>) -> Response {
+    let latest = state.preview.borrow().clone();
+    if let Some(jpeg) = latest {
+        let headers = [
+            (header::CONTENT_TYPE, "image/jpeg".to_string()),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ];
+        return (headers, jpeg).into_response();
+    }
+    if let Some(path) = state.camera.latest_still() {
+        match std::fs::File::open(&path) {
+            Ok(file) => {
+                let headers = [
+                    (header::CONTENT_TYPE, "image/jpeg".to_string()),
+                    (header::CACHE_CONTROL, "no-store".to_string()),
+                ];
+                return (headers, file_body(file)).into_response();
+            }
+            Err(e) => tracing::debug!("preview still open failed: {e}"),
+        }
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({ "error": "no preview available; camera is stopped" })),
+    )
+        .into_response()
 }
 
 // ---- websocket signaling ---------------------------------------------------
