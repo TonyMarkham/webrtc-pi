@@ -21,8 +21,8 @@ preset + `zerolatency` tune keep encoding latency to a frame or two.
 
 | Component | Choice |
 | --- | --- |
-| Capture | `rpicam-vid --codec yuv420`, raw I420 frames piped to the server (streaming), or continuous native-res frames center-cropped to 1440x1080 and JPEG-encoded (capture mode) |
-| Encode | [`x264`](https://crates.io/crates/x264) (baseline profile, 2s keyframe interval); [`turbojpeg`](https://crates.io/crates/turbojpeg) for capture-mode JPEGs |
+| Capture | `rpicam-vid --codec yuv420` raw I420 frames piped to the server for streaming; `rpicam-still --timelapse` at native sensor resolution for capture mode (still-pipeline quality, 1:1 pixels) |
+| Encode | [`x264`](https://crates.io/crates/x264) (baseline profile, 2s keyframe interval); [`turbojpeg`](https://crates.io/crates/turbojpeg) for the low-rate preview |
 | WebRTC | [`webrtc-rs`](https://github.com/webrtc-rs/webrtc) 0.21 |
 | Signaling | Embedded page + WebSocket (`/ws`), non-trickle SDP exchange |
 | HTTP | `axum` |
@@ -59,8 +59,8 @@ from boot, or `POST /camera/start` (the viewer page has buttons for this).
 The camera is a mutually exclusive resource, so the server has three modes:
 
 - **streaming** — live H.264 view in the browser (`rpicam-vid` + x264)
-- **capturing** — continuous full-res stills to disk (`rpicam-still
-  --timelapse`); the live view is necessarily off
+- **capturing** — one full-quality still per interval via `rpicam-still
+  --timelapse`; the live view is necessarily off
 - **stopped** — idle
 
 Starting one mode stops the other.
@@ -77,9 +77,8 @@ cargo run --release -- --help
 - `--port` — HTTP port (default 8080)
 - `--auto-start` — start streaming at boot
 - `--capture-dir` — where capture runs are written (default `captures`)
-- `--still-width/--still-height` — still image size (default 1440x1080); stills
-  are center-cropped from the native sensor frame, 1:1 pixels
-- `--sensor-width/--sensor-height` — native sensor frame size (default 1456x1088)
+- `--sensor-width/--sensor-height` — native sensor frame size (default 1456x1088);
+  capture-mode stills are taken at these dimensions, 1:1 sensor pixels
 - `--capture-fps` — default capture rate (default 30)
 - `--shutter` — fixed exposure in µs for stills (default 0 = auto)
 - `--gain` — fixed analog gain for stills (default 0 = auto)
@@ -87,14 +86,25 @@ cargo run --release -- --help
 
 Note: `rpicam-vid` writes YUV frames with the libcamera row stride (width
 rounded up to a multiple of 128 bytes); the pipeline handles that internally.
-At 30 fps a run writes ~180 KB/frame ≈ 5 MB/s ≈ 19 GB/hour.
+Streaming bitrate is governed by `--bitrate`.
+
+### Why capture uses rpicam-still, not rpicam-vid
+
+Recording frames out of the **video** pipeline leaves visible artifacts on
+moving parts (video-grade tuning and noise reduction). Capture mode therefore
+runs `rpicam-still --timelapse <interval>`: every still goes through the
+proper still-capture pipeline (still tuning, stronger denoise, exposure
+settle), at full native sensor resolution — no ISP resampling, 1:1 pixels.
+`fps` is the *requested* rate; `rpicam-still` may not sustain high rates and
+then simply captures as fast as it can. Stills keep rpicam-still's EXIF
+(shutter, gain, …).
 
 ### Camera control API
 
 | Route | Method | Effect |
 | --- | --- | --- |
 | `/camera/start` | POST | Switch to streaming. Idempotent. |
-| `/camera/capture?fps=30&shutter=1000&gain=8` | POST | Switch to capture mode: stop the live view and record **continuously** — every frame is written as a JPEG into a new run directory (`captures/run-<unix-seconds>/img_NNNNNN.jpg`). Frames are captured at native sensor resolution (1456x1088) and center-cropped to `--still-width/--still-height` (1440x1080), so every output pixel is a real sensor pixel — no ISP resampling. `fps` (1..60), `shutter` (µs, 0 = auto) and `gain` (0 = auto) are optional; per-request values override the CLI defaults. Use a short shutter to freeze motion — the IMX296 is global-shutter, so blur is purely exposure time — and raise gain (or lighting) to compensate. |
+| `/camera/capture?fps=30&shutter=1000&gain=8` | POST | Switch to capture mode: stop the live view and run `rpicam-still --timelapse`, writing one full-quality still per interval into a new run directory (`captures/run-<unix-seconds>/img_N.jpg`). Stills are captured at native sensor resolution (`--sensor-width/--sensor-height`, 1456x1088) — 1:1 sensor pixels, still-pipeline processing. `fps` (1..60) is the requested captures-per-second (converted to the timelapse interval; the real rate is bounded by `rpicam-still`), `shutter` (µs, 0 = auto) and `gain` (0 = auto) are optional and override the CLI defaults. Use a short shutter to freeze motion — the IMX296 is global-shutter, so blur is purely exposure time — and raise gain (or lighting) to compensate. |
 | `/camera/stop` | POST | Stop whichever mode is active. Idempotent. |
 | `/camera/status` | GET | `{"mode": "streaming"\|"capturing"\|"stopped"}`, plus `run`, `images`, `interval_secs` while capturing and `error` after a failure. |
 | `/images?limit=500` | GET | List saved stills, newest first. |
@@ -149,9 +159,9 @@ BT.601 luma for greyscale) so training and inference preprocess identically:
 
 | Variant | Size | Content |
 | --- | --- | --- |
-| `half/` | 720x540 | colour |
-| `grey/` | 1440x1080 | greyscale |
-| `half-grey/` | 720x540 | greyscale |
+| `half/` | 728x544 | colour |
+| `grey/` | 1456x1088 | greyscale |
+| `half-grey/` | 728x544 | greyscale |
 
 ## Limitations / roadmap
 

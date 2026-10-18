@@ -12,7 +12,6 @@ mod encode;
 mod preview;
 mod session;
 mod state;
-mod stillrec;
 mod web;
 
 use std::path::PathBuf;
@@ -49,12 +48,6 @@ struct Args {
     /// Directory where capture runs are written.
     #[arg(long, default_value = "captures")]
     capture_dir: String,
-    /// Still image width (capture mode).
-    #[arg(long, default_value_t = 1440)]
-    still_width: u32,
-    /// Still image height (capture mode).
-    #[arg(long, default_value_t = 1080)]
-    still_height: u32,
     /// Default capture rate in frames per second (continuous capture mode).
     #[arg(long, default_value_t = 30)]
     capture_fps: u32,
@@ -101,8 +94,6 @@ async fn main() -> anyhow::Result<()> {
     let (frames_tx, _) = broadcast::channel::<Arc<encode::EncodedFrame>>(64);
     let (preview_tx, _) = watch::channel::<Option<Bytes>>(None);
     let still = camera::StillSettings {
-        width: args.still_width,
-        height: args.still_height,
         sensor_width: args.sensor_width,
         sensor_height: args.sensor_height,
         fps: args.capture_fps,

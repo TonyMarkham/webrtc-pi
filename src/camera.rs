@@ -13,7 +13,7 @@
 //! the camera is stopped or capturing — they simply wait for frames.
 
 use std::path::{Path, PathBuf};
-use std::process::Child;
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -44,13 +44,13 @@ fn walk_jpgs(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
 /// Still-image capture settings.
 #[derive(Clone, Copy, Debug)]
 pub struct StillSettings {
-    pub width: u32,
-    pub height: u32,
-    /// Native sensor frame size; stills are center-cropped from it when the
-    /// output fits, so every output pixel is a real sensor pixel.
+    /// Native sensor frame size; `rpicam-still` captures at these
+    /// dimensions, so every output pixel is a real sensor pixel.
     pub sensor_width: u32,
     pub sensor_height: u32,
-    /// Default capture rate; overridable per request.
+    /// Default capture rate; overridable per request. This is the *requested*
+    /// rate — `rpicam-still` may not sustain it and then captures as fast as
+    /// it can.
     pub fps: u32,
     /// Fixed exposure time in microseconds; 0 = auto. Short exposures freeze
     /// motion (at the cost of gain/noise, since the IMX296 is global shutter
@@ -214,10 +214,13 @@ impl CameraManager {
         Ok(())
     }
 
-    /// Start a capture run: stop any current mode, then capture
-    /// **continuously** — every frame the camera delivers is written as a
-    /// JPEG into a fresh run directory. Idempotent only in the sense that it
-    /// always begins a *new* run.
+    /// Start a capture run: stop any current mode, then run
+    /// `rpicam-still --timelapse` — one full-quality still per interval,
+    /// written directly by rpicam-still into a fresh run directory at
+    /// native sensor resolution. The still pipeline (not the video
+    /// pipeline rpicam-vid uses) is deliberately applied here: video-mode
+    /// processing leaves visible artifacts on moving parts. Idempotent
+    /// only in the sense that it always begins a *new* run.
     pub async fn capture(
         self: &Arc<Self>,
         fps: u32,
@@ -258,71 +261,60 @@ impl CameraManager {
         let shutter_us = shutter_us.unwrap_or(self.still.shutter_us);
         let gain = gain.unwrap_or(self.still.gain);
 
-        // Capture at native sensor resolution and center-crop to the
-        // requested output size, so output pixels are 1:1 sensor pixels with
-        // no ISP resampling. Fall back to letting the ISP scale if the output
-        // doesn't fit the sensor.
-        let src_stride = capture::Frame::stride_for(self.still.sensor_width);
-        let (capture_size, crop) = if self.still.width <= self.still.sensor_width
-            && self.still.height <= self.still.sensor_height
-        {
-            (
-                (self.still.sensor_width, self.still.sensor_height),
-                crate::stillrec::Crop::centered(
-                    self.still.sensor_width,
-                    self.still.sensor_height,
-                    src_stride,
-                    self.still.width,
-                    self.still.height,
-                ),
-            )
-        } else {
-            ((self.still.width, self.still.height), None)
-        };
-        let crop = crop.unwrap_or_else(|| {
-            crate::stillrec::Crop::identity(
-                self.still.width,
-                self.still.height,
-                capture::Frame::stride_for(self.still.width),
-            )
-        });
-
-        let stopping = Arc::new(AtomicBool::new(false));
-        let camera_settings = capture::CameraSettings {
-            width: capture_size.0,
-            height: capture_size.1,
-            fps,
-        };
-        let mut extra: Vec<String> = Vec::new();
+        // One still per interval, at full native sensor dimensions.
+        // rpicam-still applies the still capture pipeline (still tuning,
+        // proper noise reduction, exposure settle), unlike the video
+        // pipeline. `--timeout 0` runs until we kill the process.
+        let interval_ms = (1000.0 / f64::from(fps)).round().max(1.0);
+        let mut args: Vec<String> = vec![
+            "--width".into(),
+            self.still.sensor_width.to_string(),
+            "--height".into(),
+            self.still.sensor_height.to_string(),
+            "--timelapse".into(),
+            format!("{interval_ms}"),
+            "--timeout".into(),
+            "0".into(),
+            "--quality".into(),
+            self.still.jpeg_quality.to_string(),
+        ];
         if shutter_us > 0 {
-            extra.push("--shutter".into());
-            extra.push(shutter_us.to_string());
+            args.push("--shutter".into());
+            args.push(shutter_us.to_string());
         }
         if gain > 0.0 {
-            extra.push("--gain".into());
-            extra.push(gain.to_string());
+            args.push("--gain".into());
+            args.push(gain.to_string());
         }
-        let (rx, mut child) = match capture::spawn(&camera_settings, Arc::clone(&stopping), &extra)
+        // `%d` is replaced by the frame counter, **not zero-padded**, so
+        // file-name ordering is not numeric; `latest_still` therefore goes
+        // by mtime.
+        args.push("--output".into());
+        args.push(run_dir.join("img_%d.jpg").to_string_lossy().into_owned());
+
+        let stopping = Arc::new(AtomicBool::new(false));
+        let mut child = match std::process::Command::new("rpicam-still")
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
         {
-            Ok(ok) => ok,
+            Ok(child) => child,
             Err(e) => {
-                let msg = format!("failed to launch rpicam-vid: {e:#}");
+                let msg = format!("failed to launch rpicam-still: {e:#}");
                 inner.last_error = Some(msg.clone());
                 anyhow::bail!(msg);
             }
         };
-        if let Err(e) =
-            crate::stillrec::spawn(crop, run_dir, self.still.jpeg_quality, rx)
-        {
-            let msg = format!("failed to start recorder thread: {e}");
-            inner.last_error = Some(msg.clone());
-            anyhow::bail!(msg);
-        }
 
+        // rpicam-still can die immediately (camera busy, no camera
+        // attached). Give it a moment so `capture` surfaces that instead
+        // of lying.
         std::thread::sleep(Duration::from_millis(300));
         if let Ok(Some(status)) = child.try_wait() {
-            let msg =
-                format!("rpicam-vid exited immediately: {status} (camera missing or in use?)");
+            let msg = format!(
+                "rpicam-still exited immediately: {status} (camera missing or in use?)"
+            );
             tracing::error!("{msg}");
             inner.last_error = Some(msg.clone());
             anyhow::bail!(msg);
@@ -339,9 +331,9 @@ impl CameraManager {
         let shutter_desc = if shutter_us > 0 { format!("{shutter_us} µs") } else { "auto".to_string() };
         let gain_desc = if gain > 0.0 { format!("{gain}") } else { "auto".to_string() };
         tracing::info!(
-            "camera started (capturing {fps} fps as {}x{} JPEGs, shutter {shutter_desc}, gain {gain_desc}, into {run})",
-            self.still.width,
-            self.still.height,
+            "camera started (capturing ~{fps} fps stills as {}x{} JPEGs via rpicam-still --timelapse, shutter {shutter_desc}, gain {gain_desc}, into {run})",
+            self.still.sensor_width,
+            self.still.sensor_height,
         );
         Ok(run)
     }
@@ -586,19 +578,19 @@ impl CameraManager {
     }
 
     /// The most recent still of the current capture run, for the preview
-    /// endpoint. `None` unless capturing.
+    /// endpoint. `None` unless capturing. Goes by mtime: rpicam-still's
+    /// `%d` frame counter is not zero-padded, so file names don't sort
+    /// numerically.
     pub fn latest_still(&self) -> Option<PathBuf> {
         let run = self.status().run?;
         let dir = self.resolve(&run)?;
-        let mut best: Option<(String, PathBuf)> = None;
+        let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
         for entry in std::fs::read_dir(dir).ok()?.flatten() {
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "jpg") {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                // Names are `img_XXXXXX.jpg`, so lexicographic order is
-                // numeric order.
-                if best.as_ref().is_none_or(|(bn, _)| name > *bn) {
-                    best = Some((name, path));
+                let modified = entry.metadata().and_then(|m| m.modified()).ok()?;
+                if best.as_ref().is_none_or(|(t, _)| modified > *t) {
+                    best = Some((modified, path));
                 }
             }
         }

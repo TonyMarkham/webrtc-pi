@@ -39,13 +39,11 @@ system libturbojpeg is too old for the 3.x API).
 ```
 camera.rs    CameraManager: mode machine (stopped/streaming/capturing) that
              owns the camera process handles; streaming = rpicam-vid+x264,
-             capture = rpicam-vid at native res + stillrec JPEG writer; also
-             image listing/download/tar/delete for capture runs
+             capture = rpicam-still --timelapse (full-res stills, still
+             pipeline quality); also image listing/download/tar/delete
 capture.rs   spawns rpicam-vid --codec yuv420, reads exact-size I420 frames
              from stdout on a dedicated thread; frames carry the libcamera
              row stride (width rounded up to 128 bytes)
-stillrec.rs  capture-mode worker: zero-copy center-crop (plane pointers +
-             strides) and TurboJPEG encode of every frame, 30 fps
 preview.rs   preview tap: box-average downscale of an I420 frame to ~640px
              + TurboJPEG, published to a watch channel (latest only)
 encode.rs    x264 encoder thread: I420 -> H.264 Annex-B, publishes frames on
@@ -63,7 +61,9 @@ Data flow is single-producer/multi-consumer: capture → encoder thread →
 The broadcast channel is created at boot and survives pipeline restarts, so
 viewers may be connected while the camera is stopped or capturing (they wait
 for frames). The camera is exclusive: entering capture mode kills the
-streaming pipeline and vice versa.
+streaming pipeline and vice versa. Capture mode has no raw-frame data flow —
+`rpicam-still` writes JPEGs to disk itself, and `/preview.jpg` serves the
+newest still of the current run in that mode.
 
 ## Critical constraints — read before changing media code
 
@@ -81,8 +81,13 @@ streaming pipeline and vice versa.
   then U then V, with **padded row strides** — the stride is the width
   rounded up to a multiple of 128 bytes (1280 -> 1280, 1456 -> 1536; see
   `capture::Frame::stride_for`). Frames are read with `read_exact`; there
-  is no framing to resync on. Capture mode reads at native sensor
-  resolution and center-crops to the still size, 1:1 pixels.
+  is no framing to resync on.
+- **Capture mode is `rpicam-still --timelapse`**, not rpicam-vid: stills
+  must go through the still pipeline because the video pipeline leaves
+  artifacts on moving parts. Consequences worth knowing: `--timeout 0` runs
+  until the manager kills the process; the `%d` frame counter in the output
+  name is **not zero-padded**, so file-name ordering is not numeric and
+  `latest_still` goes by mtime; `fps` is a request, not a guarantee.
 - **Keyframes**: browsers can only start decoding on an IDR. The encoder
   forces one every 2 s (`max_keyframe_interval = 2*fps`, `scenecut 0`), and
   viewer tasks wait for a keyframe before sending. PLI/FIR feedback is NOT
